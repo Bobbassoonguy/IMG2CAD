@@ -1,0 +1,2 @@
+Ok now make this an app that i can put in the taskbar and also right-click on image files and open them with this app. Make an icon as well.
+

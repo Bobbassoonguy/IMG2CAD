@@ -1,0 +1,151 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+A lightweight tool that converts a raster image (PNG/JPG/…) into a **DXF** file
+for import into **Onshape**. DXF was chosen deliberately: Onshape imports DXF
+natively into a sketch, so there is **no Onshape API, OAuth, or FeatureScript** —
+the whole "get geometry into CAD" problem reduces to "write a good DXF." Do not
+add an Onshape API integration unless explicitly asked; it would defeat the point.
+
+## Commands
+
+Setup (Windows, local venv):
+```
+python -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
+```
+Run the CLI / GUI (always via the venv interpreter):
+```
+.venv\Scripts\python img2cad.py sample.png            # convert -> sample.dxf
+.venv\Scripts\python img2cad_gui.py [image]           # live-preview GUI
+```
+There is **no test suite / linter configured.** Smoke-test with the checked-in
+`sample.png` and validate output structurally with ezdxf's auditor:
+```
+.venv\Scripts\python -c "import ezdxf; a=ezdxf.readfile('sample.dxf').audit(); print(len(a.errors),'errors')"
+```
+A clean DXF must audit with **0 errors** or Onshape may reject it.
+
+## Architecture
+
+Two files, one shared core:
+
+- **`img2cad.py`** — the entire pipeline and CLI, all parameterized by one
+  `Options` dataclass. Stages:
+  1. `load_binary()` — decode, composite alpha over white, grayscale, blur, then
+     **binarize**. Otsu by default (auto threshold) or `--canny` for outline
+     tracing. Note the inversion convention: the *shape* must end up white (255);
+     for the common dark-shape-on-light-background case Otsu makes the background
+     white, so it inverts unless `--invert`/`opt.invert` says the foreground is light.
+  2. `find_contours()` — `cv2.findContours` with **`CHAIN_APPROX_NONE`** (dense
+     per-pixel boundary; the fitter needs it — a 4-point rectangle from
+     `CHAIN_APPROX_SIMPLE` spuriously fits a circumscribed circle). `RETR_CCOMP`
+     keeps interior holes as separate loops (a washer imports as two curves).
+  3. **`_vectorize_path()` — the core "best-fit" geometry inference.** For each
+     ordered path: `_depixel()` low-passes the raster staircase to recover the true
+     smooth path; `_detect_corners()` splits at genuine sharp turns; `_fit_segment()`
+     greedily fits the *simplest primitive within `opt.tol` px* — a straight **line**
+     (`_fit_line`, chord-based), else a circular **arc** (`_fit_circle`, algebraic
+     Kasa fit), else recursively splits, falling back to a **spline** only for truly
+     freeform runs. A corner-free closed loop that fits a circle becomes a single
+     CIRCLE. Primitives are dicts `{"kind": line|arc|circle|spline, ...}`.
+     `vectorize_contour()` feeds an outline contour through it; `vectorize_centerline()`
+     feeds skeleton paths (see below). The legacy `simplify_contour()` (Douglas-
+     Peucker, `opt.fit=False`) still exists for one-spline-per-contour output.
+
+     **`build_items(mask, opt)` is the single dispatch entry** used by both CLI and
+     GUI: centerline → `vectorize_centerline`, else fit → `vectorize_all`, else legacy.
+  3b. **Centerline mode (`opt.centerline`).** `skeleton_paths()` runs
+     `skimage.morphology.skeletonize` on the mask, then walks the 1px skeleton as a
+     pixel graph (nodes = endpoints/junctions with ≠2 neighbors; edges traced through
+     degree-2 runs; isolated loops handled separately; sub-`prune`-length spurs
+     dropped). Each traced path is vectorized like an open contour, giving a single
+     medial stroke instead of a double outline. Adds a **scikit-image** dependency.
+  3c. **`auto_adjust(path)`** inspects the image (border brightness → invert; image
+     diagonal → tol/depixel/weld; contour-area distribution → min_area; foreground
+     fraction + distance-transform stroke half-width → centerline) and returns a dict
+     of suggested settings. The GUI's ✦ Auto-adjust button applies them.
+  4. `write_dxf()` — ezdxf; consumes primitive-lists (fit/centerline) or point-arrays
+     (legacy) and emits real **LINE / ARC / CIRCLE / SPLINE** entities. Returns a
+     tally dict. The point transform (`make_transform`) composes **Y-flip → per-axis
+     scale (`resolve_scale`, units-per-px) → rotation about the drawing center**.
+     `opt.units` sets the DXF units header. When the scale is **non-uniform**
+     (`sx≠sy`, i.e. aspect unlocked) circles/arcs can't stay circular, so they are
+     sampled to splines; lines/splines stay exact. Optional `_emit_guides` adds a
+     dashed **bounding box** (BBOX layer) and **center cross-hairs** (CENTERLINES
+     layer), framed on the geometry or the image per `opt.guide_ref`.
+
+     **`fillet_path()`** (applied in `build_items` when `opt.fillet>0`) inserts a
+     tangent arc at sharp **line→line** corners: it trims both lines by
+     `r/tan(α/2)` and drops in an arc through the tangent points. Only line-line
+     corners are filleted (arc-involved corners are already curved); radius is auto-
+     clamped to fit the shorter line.
+
+  **Arc orientation is the subtle part.** `_arc_angles(center, p0, pm, p1)` picks
+  the sweep (CCW vs CW / minor vs major) that passes through the segment midpoint
+  `pm`, and returns the CCW `(start, end)` ezdxf needs. Angles are **recomputed
+  from transformed points inside `write_dxf`** (not reused from image space) so the
+  Y-flip's handedness change is handled correctly. If you touch arcs, re-verify by
+  rendering the written DXF back (read entities → sample → compare to source).
+
+  **Connectivity / closed shapes.** An arc is stored as just its 3 defining points
+  `p0, pm, p1`; the actual circle is derived on demand via `_circle_from_3()`, so
+  the arc always passes *exactly* through its (possibly welded) endpoints — no gap
+  to neighbors, and endpoint dots land on the curve. `_fit_line` likewise returns
+  the raw segment endpoints (chord fit), not a floating best-fit line, so adjacent
+  primitives share exact junctions. `weld_endpoints()` then runs globally
+  (`vectorize_all`, `opt.weld` px, union-find over a grid) to fuse near-coincident
+  endpoints across the whole drawing, closing seams so Onshape sees fillable
+  closed profiles. Because arcs/lines derive geometry from their endpoint fields,
+  welding those fields in place is enough — no separate re-fit needed.
+
+- **`img2cad_gui.py`** — Tkinter front end that `import img2cad as core` and reuses
+  the same functions (via `build_items`), so GUI and CLI never diverge. Preview is
+  drawn with OpenCV, PNG-encoded in memory, shown via `tk.PhotoImage`. Layout is a
+  themed **sidebar** (all controls) + a zoom/pan **canvas studio** + status bar.
+  Theming: a `clam` ttk.Style configured from the `T` palette dict ("Slate + Teal");
+  primitive colors live in `COLORS` (BGR) and feed both the drawing and the legend.
+  Notes: slider drags are **debounced** (`_schedule`, 70 ms) so centerline recompute
+  stays smooth. Geometry is computed in image space (`draw_img`) then transformed
+  into a display space (`_rebuild_display` → `dbase`/`ddraw`/`dw`/`dh`) applying both
+  rotation and the non-uniform aspect stretch (`_scale_ratio`), so the **preview is
+  WYSIWYG**; zoom/pan operate on that display space. Any control that changes rotation
+  *or* aspect must call `_rebuild_display` before `_blit` (a plain `_blit` won't show a
+  new stretch — it's baked into `dbase`/`ddraw`). **Scale model:** the canonical value
+  is the target OUTPUT size in mm (`tw_mm`/`th_mm`, object-axis / pre-rotation extent
+  of the chosen reference), not mm/px — so it stays fixed when a tuning slider changes
+  the geometry extent; `_opts` derives `scale_x/scale_y` as `target/reference_px`. The
+  binarized mask is cached (`_mask_cache`, keyed on `path,invert,canny,blur,threshold`)
+  so slider drags don't re-decode the image. The Rotate spinbox
+  holds **clockwise** degrees; preview uses cv2 angle `-deg` and export uses
+  `opt.rotate = -deg` (its transform is CCW in y-up), so both turn the same way —
+  verified by rendering preview vs DXF. Mouse-wheel scrolls the sidebar via
+  `_bind_wheel` (recursively bound per-widget, not `bind_all`, so it never fights the
+  image canvas's zoom wheel).
+  Only Tkinter is needed at runtime; Pillow is used **only** by the screenshot test
+  harness, not the app.
+
+- **`*.bat`** — Windows convenience launchers (drag-drop convert, GUI). They prefer
+  `.venv\Scripts\python[w]` and fall back to system `python[w]`.
+
+- **`packaging/`** — turns the tool into a standalone Windows app. `make_icon.py`
+  generates `img2cad.ico` (PIL); `build.ps1` runs PyInstaller (windowed, onedir,
+  bundles skimage/ezdxf data) → `dist\img2cad\img2cad.exe`; `install.ps1` /
+  `uninstall.ps1` do a per-user (HKCU, no admin) install: copy to
+  `%LOCALAPPDATA%\Programs\img2cad`, Start-Menu/Desktop shortcuts, and register
+  "Open with img2cad" for image extensions. The GUI's `main()` sets an explicit
+  AppUserModelID (`img2cad.app`) and window icon via `_icon_path()` (resolves both
+  from source and from a PyInstaller `sys._MEIPASS` bundle). The app already accepts
+  an image path as `argv[1]`, which is what the file association passes.
+
+## Conventions that matter
+
+- **Keep it one-file-core + stdlib GUI.** The project's value is being scrappy and
+  lightweight. Prefer OpenCV/NumPy/SciPy/ezdxf primitives over new dependencies.
+- Anything the GUI needs must live as a reusable function in `img2cad.py` taking an
+  `Options`, not be reimplemented in the GUI.
+- Simplification tolerances are expressed as fractions of perimeter, never raw
+  pixel counts, so behavior is consistent across image sizes.

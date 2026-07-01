@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+build/
+dist/
+img2cad.spec
+packaging/img2cad.png
+*.dxf
+!sample*.dxf
