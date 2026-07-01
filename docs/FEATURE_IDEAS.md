@@ -1,4 +1,4 @@
-# img2cad — 20 Ideas to Make Image → DXF → CAD 100× Easier
+# img2cad — 21 Ideas to Make Image → DXF → CAD 100× Easier
 
 Ranked, scored ideas spanning quick fixes → re-architectures, all aimed at one
 goal: **fewer steps and less fiddling between "I have a picture" and "I'm
@@ -21,6 +21,7 @@ validated the whole DXF-native premise and surfaced several concrete wins.
 
 | # | Idea | Cmplx | QoL | Bang | Tier |
 |---|------|:---:|:---:|:---:|------|
+| 21 | Click-to-scale: 1- & 2-line real-world scaler | 3 | 5 | ★★★ | Medium |
 | 1 | Paste image from clipboard (Ctrl+V) | 2 | 5 | ★★★ | Quick |
 | 7 | In-GUI crop / region-of-interest box | 3 | 5 | ★★★ | Medium |
 | 14 | Axis & angle snapping (constraint-friendly output) | 3 | 5 | ★★★ | Geometry |
@@ -42,11 +43,11 @@ validated the whole DXF-native premise and surfaced several concrete wins.
 | 18 | Intelligent-scissors assisted tracing | 5 | 4 | ★ | Bigger |
 | 20 | FeatureScript emitter (API-free Onshape push) | 5 | 3 | ★ | Bigger |
 
-**Recommended first five (best effort-to-payoff):** #1 clipboard paste, #7 crop
-box, #3 audit badge, #5 gap highlighter, #14 axis/angle snapping. Together they
-kill the most common friction points — the round-trip to save a file, isolating a
-subject, and the "why won't it extrude / why is my sketch unconstrainable" surprises
-in Onshape.
+**Recommended first six (best effort-to-payoff):** #21 click-to-scale, #1 clipboard
+paste, #7 crop box, #3 audit badge, #5 gap highlighter, #14 axis/angle snapping.
+Together they kill the most common friction points — the round-trip to save a file,
+setting real-world size by hand, isolating a subject, and the "why won't it extrude /
+why is my sketch unconstrainable" surprises in Onshape.
 
 ---
 
@@ -123,6 +124,33 @@ A post-fit cleanup: merge consecutive **collinear lines** into one, fuse
 **co-radial adjacent arcs**, and collapse a full ring of arcs into a single
 **CIRCLE**. Fewer, cleaner entities = a tidier Onshape sketch and safe distance from
 the ~8000-entity wall the research flagged. Complements the existing fitter.
+
+---
+
+### 21. Click-to-scale: 1- & 2-line real-world scaler ★ · Cmplx 3 · QoL 5
+Set true size by *measuring the image*, not by guessing mm-per-pixel.
+
+- **1-line scaler (locked aspect):** click a **start** and **end** point on a
+  feature of known length (both points snap-lock to the image), type the real
+  length (e.g. `50 mm`), and the whole drawing rescales — **uniformly, aspect
+  preserved** — so that measured span comes out exactly right. This directly drives
+  the canonical output-size model (`tw_mm`/`th_mm`): the line length in pixels ×
+  chosen units-per-... resolves into `scale_x = scale_y`. Mirrors Onshape's own
+  "first dimension scales the sketch" trick, done up front so the DXF lands
+  correctly sized on import.
+- **2-line scaler (unlocks aspect):** drop **two** known-length lines — typically one
+  roughly horizontal and one roughly vertical — and enter each true length. This
+  **unlocks aspect ratio** and solves `scale_x` and `scale_y` **independently**, so a
+  photo that's slightly skewed/keystoned (shot at an angle, non-square pixels) is
+  corrected. Falls back gracefully: if both lines imply the same ratio, it's just the
+  1-line result.
+
+Fits the existing architecture cleanly: the GUI already has a WYSIWYG display↔image
+transform and a non-uniform `scale_x`/`scale_y` model with a Lock-aspect toggle —
+this feature is the *interactive front end* to those values. Show the live measured
+length and resulting output size as you drag. Persist the scale lines in the project
+file (#19) so a re-open keeps the calibration. Enormous QoL: "correct real-world
+size" goes from trial-and-error typing to two clicks and a number.
 
 ---
 
