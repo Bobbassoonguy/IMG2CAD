@@ -53,6 +53,11 @@ why is my sketch unconstrainable" surprises in Onshape.
 
 ## Tier 1 — Quick wins
 
+> **✅ Tier 1 is implemented** (clipboard paste, batch/folder convert, live audit
+> badge, presets + remember-last, gap highlighter, SVG/PDF export). The GUI sidebar
+> was reorganized into Source → Preset → Mode → Tuning → Scale/Output → Display →
+> Legend, with a pinned audit badge + Export button. See CLAUDE.md for specifics.
+
 ### 1. Paste image from clipboard (Ctrl+V) ★ · Cmplx 2 · QoL 5
 Let the GUI accept an image straight from the clipboard — snip a region of your
 screen, or copy an image from a browser/PDF, and paste it in. Eliminates the

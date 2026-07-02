@@ -13,10 +13,12 @@ No Onshape API or login needed — Onshape imports DXF natively into a sketch.
    python -m venv .venv
    .venv\Scripts\python -m pip install -r requirements.txt
    ```
-2. **Easiest:** double-click **`img2cad-gui.bat`** → Open image → click
-   **✦ Auto-adjust** (it inspects the image and sets everything for you) → glance
-   at the preview → **Save DXF**. Fine-tune with the sidebar sliders if needed.
-   Or drag a PNG onto **`convert-drop.bat`** to make a `.dxf` beside it instantly.
+2. **Easiest:** double-click **`img2cad-gui.bat`** → Open an image (or **paste one
+   with Ctrl+V**) → pick a **Preset** and/or click **✦ Auto-adjust** → glance at the
+   preview → **Export…** (DXF for Onshape, or SVG/PDF). The status bar shows a live
+   **audit badge** (`0 audit errors ✓`) and any **open gaps** are flagged as red dots.
+   Your settings are remembered next launch. Or drag a PNG onto **`convert-drop.bat`**
+   to make a `.dxf` beside it instantly.
 3. In Onshape: start a sketch (or right-click a plane) → **Import DXF/DWG** →
    pick the file → extrude / fillet as normal.
 
@@ -33,6 +35,9 @@ No Onshape API or login needed — Onshape imports DXF natively into a sketch.
 .venv\Scripts\python img2cad.py photo.jpg --canny           # trace outlines, not fills
 .venv\Scripts\python img2cad.py logo.png --centerline       # single medial path per stroke
 .venv\Scripts\python img2cad.py part.png --no-fit           # one plain spline per contour
+.venv\Scripts\python img2cad.py logo.png --format svg       # export SVG (or pdf) instead of DXF
+.venv\Scripts\python img2cad.py *.png -o out\               # batch: one file each into out\
+.venv\Scripts\python img2cad.py images\ --format dxf        # convert every image in a folder
 ```
 
 **Outline vs Centerline:** outline mode traces both edges of every stroke (a

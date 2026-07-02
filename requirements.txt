@@ -3,3 +3,4 @@ numpy>=1.26
 ezdxf>=1.1
 scipy>=1.11
 scikit-image>=0.22
+pillow>=10.0        # GUI clipboard paste (ImageGrab); optional at runtime

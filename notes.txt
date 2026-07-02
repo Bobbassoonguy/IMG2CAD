@@ -1,2 +1,5 @@
-Ok now make this an app that i can put in the taskbar and also right-click on image files and open them with this app. Make an icon as well.
 
+
+execute @docs\FEATURE_IDEAS.md tier 1. Reorganize the UI to make it intuitive as you add extra features. Make sure the UI is easy to understand and use. Test using the @Alex and Hannah Wedding Seal_ Simplified Wax Seal_2.png and the screenshotting tool and zooming in to check splines and features.
+
+  Ultrathink

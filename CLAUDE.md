@@ -20,8 +20,12 @@ python -m venv .venv
 Run the CLI / GUI (always via the venv interpreter):
 ```
 .venv\Scripts\python img2cad.py sample.png            # convert -> sample.dxf
+.venv\Scripts\python img2cad.py a.png b.png -o out    # batch -> out\*.dxf
+.venv\Scripts\python img2cad.py imgs\ --format svg    # folder -> one .svg each
 .venv\Scripts\python img2cad_gui.py [image]           # live-preview GUI
 ```
+The CLI accepts multiple images / folders (batch), and `--format dxf|svg|pdf`
+(also inferred from the `-o` extension). `-o` naming a directory = output folder.
 There is **no test suite / linter configured.** Smoke-test with the checked-in
 `sample.png` and validate output structurally with ezdxf's auditor:
 ```
@@ -70,7 +74,13 @@ Two files, one shared core:
      of suggested settings. The GUI's ✦ Auto-adjust button applies them.
   4. `write_dxf()` — ezdxf; consumes primitive-lists (fit/centerline) or point-arrays
      (legacy) and emits real **LINE / ARC / CIRCLE / SPLINE** entities. Returns a
-     tally dict. The point transform (`make_transform`) composes **Y-flip → per-axis
+     tally dict. It's split so the GUI can reuse the geometry: **`build_doc()`**
+     builds the in-memory ezdxf doc + tally; `write_dxf` saves it; **`audit_items()`**
+     builds + runs ezdxf's `.audit()` and returns `(tally, error_count)` for the GUI's
+     live badge (no disk touch). **`export_file()`** dispatches by output extension to
+     `write_dxf` / **`write_svg`** / **`write_pdf`** (SVG = real line/circle + sampled
+     polylines, real-world sized via the unit; PDF = a minimal hand-rolled single-page
+     vector doc, flattened polylines). The point transform (`make_transform`) composes **Y-flip → per-axis
      scale (`resolve_scale`, units-per-px) → rotation about the drawing center**.
      `opt.units` sets the DXF units header. When the scale is **non-uniform**
      (`sx≠sy`, i.e. aspect unlocked) circles/arcs can't stay circular, so they are
@@ -101,13 +111,36 @@ Two files, one shared core:
   endpoints across the whole drawing, closing seams so Onshape sees fillable
   closed profiles. Because arcs/lines derive geometry from their endpoint fields,
   welding those fields in place is enough — no separate re-fit needed.
+  **`open_endpoints(items, tol)`** is the read-only inverse: it reuses the same grid
+  to return endpoints that *don't* meet any neighbor within `tol` (the gaps welding
+  didn't close) so the GUI can flag them red — Onshape won't auto-join those seams.
 
 - **`img2cad_gui.py`** — Tkinter front end that `import img2cad as core` and reuses
   the same functions (via `build_items`), so GUI and CLI never diverge. Preview is
   drawn with OpenCV, PNG-encoded in memory, shown via `tk.PhotoImage`. Layout is a
-  themed **sidebar** (all controls) + a zoom/pan **canvas studio** + status bar.
-  Theming: a `clam` ttk.Style configured from the `T` palette dict ("Slate + Teal");
-  primitive colors live in `COLORS` (BGR) and feed both the drawing and the legend.
+  themed **sidebar** (Source → Preset → Mode → Tuning → Scale/Output → Display →
+  Legend) + a zoom/pan **canvas studio** + status bar; a pinned bottom holds the live
+  **audit badge** + **Export** button. Theming: a `clam` ttk.Style configured from the
+  `T` palette dict ("Slate + Teal"); primitive colors live in `COLORS` (BGR, `GAP_BGR`
+  is the red open-endpoint dot) and feed both the drawing and the legend.
+  **Tier-1 features:** *Paste* (Ctrl+V / button, `paste_clipboard` via `PIL.ImageGrab`
+  to a temp PNG — Pillow is an optional runtime dep, guarded); *Presets* (`PRESETS`
+  recipes set MODE+TUNING; any manual mode/slider change flips the combobox to "Custom"
+  via the `_applying` guard); *remember-last* (`_save_prefs`/`_p` persist all
+  mode/tuning/display/scale settings to `~/.img2cad_gui.json`, restored on launch, saved
+  on `WM_DELETE_WINDOW`); *live audit* (`_update_audit` → `core.audit_items`, ~15 ms,
+  shows `N entities · 0 audit errors ✓` or a `⚠` with error/gap counts); *gap
+  highlighter* (`core.open_endpoints` → red dots, toggled by "Flag open gaps");
+  *Export* (`core.export_file` picks DXF/SVG/PDF by the save-dialog extension).
+  **Window sizing:** `main()` clamps height to the screen (`sh-80`) so the pinned
+  Export button is always reachable and the sidebar scrolls above it.
+  **Scroll-canvas gotcha:** the sidebar is a frame embedded in a `tk.Canvas`; when it's
+  taller than the viewport, Windows Tk does *not* clip the embedded frame, so its
+  overflow would stack above and white-out the pinned Export area — the pinned frame is
+  therefore `.lift()`ed above the canvas and abuts it with no exposed parent padding.
+  (A large white block below the on-screen fold in a `screenshot_app.ps1` grab is just
+  PrintWindow failing to render off-screen native widgets — not a real bug; size the
+  window to fit the screen to verify the lower sidebar.)
   Notes: slider drags are **debounced** (`_schedule`, 70 ms) so centerline recompute
   stays smooth. Geometry is computed in image space (`draw_img`) then transformed
   into a display space (`_rebuild_display` → `dbase`/`ddraw`/`dw`/`dh`) applying both
@@ -125,8 +158,9 @@ Two files, one shared core:
   verified by rendering preview vs DXF. Mouse-wheel scrolls the sidebar via
   `_bind_wheel` (recursively bound per-widget, not `bind_all`, so it never fights the
   image canvas's zoom wheel).
-  Only Tkinter is needed at runtime; Pillow is used **only** by the screenshot test
-  harness, not the app.
+  Tkinter is the only hard runtime dep; **Pillow** is now used by the app too, but
+  *only* for clipboard paste (imported lazily, with a friendly install prompt if
+  absent) — everything else still runs without it.
 
 - **`*.bat`** — Windows convenience launchers (drag-drop convert, GUI). They prefer
   `.venv\Scripts\python[w]` and fall back to system `python[w]`.

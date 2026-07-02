@@ -13,6 +13,7 @@ import base64
 import json
 import os
 import sys
+import tempfile
 import tkinter as tk
 from collections import Counter
 from tkinter import filedialog, messagebox, ttk
@@ -26,6 +27,21 @@ MIN_ZOOM, MAX_ZOOM = 1.0, 12.0
 UNIT_MM = {"mm": 1.0, "cm": 10.0, "in": 25.4, "m": 1000.0}   # mm per output unit
 PREFS = os.path.join(os.path.expanduser("~"), ".img2cad_gui.json")
 
+# Named starting points. Each sets MODE + rough TUNING; Auto-adjust then fine-tunes
+# the sliders to the actual image. "Custom" is auto-selected once the user diverges.
+PRESETS = {
+    "Filled shape":       dict(fit=True, centerline=False, canny=False, invert=False,
+                               simplify=2.0, dejag=1.2, weldval=1.5, filletval=0.0, minarea=40),
+    "Logo / flat art":    dict(fit=True, centerline=False, canny=False, invert=False,
+                               simplify=1.5, dejag=1.5, weldval=2.0, filletval=0.0, minarea=25),
+    "Line art (strokes)": dict(fit=True, centerline=True, canny=False, invert=False,
+                               simplify=2.0, dejag=1.5, weldval=2.0, filletval=0.0, minarea=20),
+    "Outline trace":      dict(fit=True, centerline=False, canny=True, invert=False,
+                               simplify=2.0, dejag=1.2, weldval=2.0, filletval=0.0, minarea=15),
+}
+PRESET_KEYS = ["fit", "centerline", "canny", "invert",
+               "simplify", "dejag", "weldval", "filletval", "minarea"]
+
 # "Slate + Teal" palette - simple, cool, and it lets the geometry colors pop.
 T = {
     "bg": "#0f131a", "panel": "#171d27", "elevated": "#222b38", "line": "#2c3644",
@@ -34,6 +50,7 @@ T = {
 }
 COLORS = {"line": (1, 179, 245), "arc": (238, 211, 34),
           "circle": (128, 222, 74), "spline": (249, 121, 232)}
+GAP_BGR = (60, 60, 255)           # red for open/un-welded endpoints (BGR)
 CANVAS_BGR = (19, 14, 11)
 GUIDE_BOX = (150, 150, 150)       # faint gray for the bounding box
 GUIDE_CTR = (180, 190, 120)       # faint teal for the centerlines
@@ -84,9 +101,13 @@ class App:
         self.dbbox = None; self.dimgbox = None
         self.bounds = None            # geometry bounds in image coords
         self.is_prim = True
+        self.gap_pts = np.empty((0, 2))   # open endpoints in image coords
+        self.dgaps = np.empty((0, 2))     # ... transformed into display coords
+        self.audit_txt = ""               # "· 0 audit errors ✓" for the status bar
         self._drag = None
         self._pending = None
         self._rot_pending = None
+        self._applying = False            # guard: applying a preset shouldn't flip to Custom
         self._note = ""
         self._sliders = []
         # Canonical scale = target OUTPUT size (object-axis) in mm for the current
@@ -115,6 +136,20 @@ class App:
                 "lock": self.lock.get(), "rot": self.rot.get(),
                 "show_guides": self.show_guides.get(), "exp_bbox": self.exp_bbox.get(),
                 "exp_center": self.exp_center.get()}
+        # Remember-last: also persist MODE, TUNING, display toggles and preset,
+        # so the app opens next time exactly as it was left.
+        try:
+            data.update({
+                "preset": self.preset.get(),
+                "fit": self.fit.get(), "centerline": self.centerline.get(),
+                "canny": self.canny.get(), "invert": self.invert.get(),
+                "show_pts": self.show_pts.get(), "show_gaps": self.show_gaps.get(),
+                "simplify": self.simplify.get(), "dejag": self.dejag.get(),
+                "weldval": self.weldval.get(), "filletval": self.filletval.get(),
+                "minarea": self.minarea.get(),
+            })
+        except AttributeError:      # called before all widgets exist
+            pass
         try:
             with open(PREFS, "w", encoding="utf-8") as f:
                 json.dump(data, f)
@@ -180,11 +215,19 @@ class App:
         outer = ttk.Frame(self.root, style="Sidebar.TFrame", width=298)
         outer.grid(row=0, column=0, sticky="ns"); outer.grid_propagate(False)
 
+        # One opaque pinned frame (separator + audit badge + Export button). It abuts
+        # the scroll canvas with NO exposed parent padding, then is lifted above the
+        # canvas — so the taller-than-viewport scroll frame can't bleed white through
+        # any seam (Windows Tk doesn't clip canvas-embedded windows to the viewport).
         savewrap = ttk.Frame(outer, style="Sidebar.TFrame")
-        savewrap.pack(side="bottom", fill="x", padx=16, pady=(6, 14))
-        self.save_btn = ttk.Button(savewrap, text="Save DXF…", command=self.save, state="disabled")
-        self.save_btn.pack(fill="x")
-        ttk.Separator(outer).pack(side="bottom", fill="x", padx=16)
+        savewrap.pack(side="bottom", fill="x")
+        ttk.Separator(savewrap).pack(fill="x", padx=16)
+        self.audit_lbl = ttk.Label(savewrap, text="", style="Read.TLabel", anchor="center")
+        self.audit_lbl.pack(fill="x", padx=16, pady=(8, 5))
+        self.save_btn = ttk.Button(savewrap, text="Export…  (DXF · SVG · PDF)",
+                                   style="Accent.TButton", command=self.save, state="disabled")
+        self.save_btn.pack(fill="x", padx=16, pady=(0, 14))
+        self._pinned = (savewrap,)
 
         sc = tk.Canvas(outer, background=T["panel"], highlightthickness=0, width=272)
         vsb = ttk.Scrollbar(outer, orient="vertical", command=sc.yview, style="Vertical.TScrollbar")
@@ -199,41 +242,63 @@ class App:
 
         ttk.Label(side, text="img2cad", style="Title.TLabel").pack(anchor="w")
         ttk.Label(side, text="image → Onshape DXF", style="Sub.TLabel").pack(anchor="w")
-        ttk.Button(side, text="Open image…", command=self.pick).pack(fill="x", pady=(12, 0))
+
+        # SOURCE — open a file or paste straight from the clipboard (Ctrl+V).
+        src = ttk.Frame(side, style="Sidebar.TFrame"); src.pack(fill="x", pady=(12, 0))
+        ttk.Button(src, text="Open image…", command=self.pick).pack(
+            side="left", fill="x", expand=True, padx=(0, 4))
+        ttk.Button(src, text="⎘ Paste", width=8, command=self.paste_clipboard).pack(side="left")
+
+        # PRESET — a named starting recipe; Auto-adjust then fine-tunes to the image.
+        self._section(side, "PRESET")
+        self.preset = tk.StringVar(value=self._p("preset", "Filled shape"))
+        pcb = ttk.Combobox(side, textvariable=self.preset, state="readonly",
+                           values=list(PRESETS) + ["Custom"])
+        pcb.pack(fill="x")
+        pcb.bind("<<ComboboxSelected>>", lambda e: self.apply_preset())
 
         # MODE (Auto-adjust never touches these)
         self._section(side, "MODE")
-        self.fit = tk.BooleanVar(value=True)
-        self.centerline = tk.BooleanVar(value=False)
-        self.canny = tk.BooleanVar(value=False)
-        self.invert = tk.BooleanVar(value=False)
-        self.show_pts = tk.BooleanVar(value=True)
-        self._check(side, "Fit lines & arcs", self.fit)
-        self._check(side, "Centerline (single path)", self.centerline)
-        self._check(side, "Trace outlines (Canny)", self.canny)
-        self._check(side, "Invert (light shape)", self.invert)
-        self._check(side, "Show points", self.show_pts, redraw_only=True)
+        self.fit = tk.BooleanVar(value=self._p("fit", True))
+        self.centerline = tk.BooleanVar(value=self._p("centerline", False))
+        self.canny = tk.BooleanVar(value=self._p("canny", False))
+        self.invert = tk.BooleanVar(value=self._p("invert", False))
+        self.show_pts = tk.BooleanVar(value=self._p("show_pts", True))
+        self.show_gaps = tk.BooleanVar(value=self._p("show_gaps", True))
+        self._check(side, "Fit lines & arcs", self.fit, mode=True)
+        self._check(side, "Centerline (single path)", self.centerline, mode=True)
+        self._check(side, "Trace outlines (Canny)", self.canny, mode=True)
+        self._check(side, "Invert (light shape)", self.invert, mode=True)
 
         # TUNING (Auto-adjust sets the sliders here, except Fillet)
         self._section(side, "TUNING")
         self.auto_btn = ttk.Button(side, text="✦  Auto-adjust", style="Accent.TButton",
                                    command=self.auto, state="disabled")
         self.auto_btn.pack(fill="x", pady=(0, 2))
-        self.simplify = self._slider(side, "Simplify", 0.5, 8.0, 2.0)
-        self.dejag = self._slider(side, "De-jag", 0.0, 4.0, 1.2)
-        self.weldval = self._slider(side, "Weld gaps", 0.0, 6.0, 1.5)
-        self.filletval = self._slider(side, "Fillet corners", 0.0, 25.0, 0.0)
-        self.minarea = self._slider(side, "Ignore specks", 0.0, 1000.0, 40.0, fmt="{:.0f}")
+        self.simplify = self._slider(side, "Simplify", 0.5, 8.0, self._p("simplify", 2.0))
+        self.dejag = self._slider(side, "De-jag", 0.0, 4.0, self._p("dejag", 1.2))
+        self.weldval = self._slider(side, "Weld gaps", 0.0, 6.0, self._p("weldval", 1.5))
+        self.filletval = self._slider(side, "Fillet corners", 0.0, 25.0, self._p("filletval", 0.0))
+        self.minarea = self._slider(side, "Ignore specks", 0.0, 1000.0,
+                                    self._p("minarea", 40.0), fmt="{:.0f}")
 
         self._section(side, "SCALE / OUTPUT")
         self._build_scale(side)
 
+        # DISPLAY — viewer-only toggles (never change the exported geometry).
+        self._section(side, "DISPLAY")
+        self._check(side, "Show points", self.show_pts, redraw_only=True)
+        self._check(side, "Flag open gaps (red)", self.show_gaps, redraw_only=True)
+        ttk.Checkbutton(side, text="Show guides in viewer", variable=self.show_guides,
+                        command=lambda: (self._blit(), self._save_prefs())).pack(anchor="w", pady=1)
+
         self._section(side, "LEGEND")
         leg = ttk.Frame(side, style="Sidebar.TFrame"); leg.pack(fill="x", pady=(0, 4))
-        for kind, bgr in COLORS.items():
-            cell = ttk.Frame(leg, style="Sidebar.TFrame"); cell.pack(side="left", padx=(0, 9))
+        legend = list(COLORS.items()) + [("gap", GAP_BGR)]
+        for kind, bgr in legend:
+            cell = ttk.Frame(leg, style="Sidebar.TFrame"); cell.pack(side="left", padx=(0, 8))
             tk.Label(cell, text="■", fg=_hex(bgr), bg=T["panel"], font=("Segoe UI", 9)).pack(side="left")
-            ttk.Label(cell, text=kind, style="Sub.TLabel").pack(side="left", padx=(3, 0))
+            ttk.Label(cell, text=kind, style="Sub.TLabel").pack(side="left", padx=(2, 0))
 
         # Right: canvas studio + status bar
         right = ttk.Frame(self.root, style="Bar.TFrame")
@@ -257,6 +322,19 @@ class App:
         # which would also fire while zooming over the image canvas).
         self._bind_wheel(self._sidebar)
         self._bind_wheel(self._sc)
+        # The scroll canvas embeds a frame taller than its viewport; on Windows Tk
+        # doesn't clip that overflow, and (being created last) it would stack above
+        # and white-out the pinned Export button. Raise the pinned area above it.
+        for w in self._pinned:
+            w.lift()
+
+        self.root.bind("<Control-v>", lambda e: self.paste_clipboard())
+        self.root.bind("<Control-V>", lambda e: self.paste_clipboard())
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_close(self):
+        self._save_prefs()
+        self.root.destroy()
 
     def _bind_wheel(self, widget):
         widget.bind("<MouseWheel>", self._sidebar_scroll)
@@ -287,9 +365,20 @@ class App:
         ttk.Separator(parent).pack(fill="x", pady=(11, 0))
         ttk.Label(parent, text=text, style="Section.TLabel").pack(anchor="w", pady=(6, 1))
 
-    def _check(self, parent, text, var, redraw_only=False):
-        cmd = self._blit if redraw_only else self._schedule
+    def _check(self, parent, text, var, redraw_only=False, mode=False):
+        if redraw_only:
+            cmd = lambda: (self._blit(), self._save_prefs())
+        elif mode:
+            cmd = self._on_mode_change
+        else:
+            cmd = self._schedule
         ttk.Checkbutton(parent, text=text, variable=var, command=cmd).pack(anchor="w", pady=1)
+
+    def _on_mode_change(self):
+        """A MODE toggle diverges from the preset -> mark Custom, then recompute."""
+        if not self._applying:
+            self.preset.set("Custom")
+        self._schedule()
 
     def _slider(self, parent, text, lo, hi, init, fmt="{:.1f}"):
         row = ttk.Frame(parent, style="Sidebar.TFrame"); row.pack(fill="x", pady=(7, 0))
@@ -298,7 +387,10 @@ class App:
         var = tk.DoubleVar(value=init)
 
         def on(*_):
-            val.config(text=fmt.format(var.get())); self._schedule()
+            val.config(text=fmt.format(var.get()))
+            if not self._applying:
+                self.preset.set("Custom")
+            self._schedule()
 
         ttk.Scale(parent, from_=lo, to=hi, variable=var, command=on,
                   style="Horizontal.TScale").pack(fill="x", pady=(2, 0))
@@ -350,8 +442,6 @@ class App:
 
         self.readout = ttk.Label(parent, text="", style="Read.TLabel"); self.readout.pack(anchor="w", pady=(6, 2))
 
-        ttk.Checkbutton(parent, text="Show guides in viewer", variable=self.show_guides,
-                        command=lambda: (self._blit(), self._save_prefs())).pack(anchor="w", pady=1)
         ttk.Checkbutton(parent, text="Export bounding box", variable=self.exp_bbox,
                         command=self._save_prefs).pack(anchor="w", pady=1)
         ttk.Checkbutton(parent, text="Export centerlines", variable=self.exp_center,
@@ -474,6 +564,60 @@ class App:
         if p:
             self.load(p)
 
+    def paste_clipboard(self):
+        """Load an image straight from the clipboard (Ctrl+V or the Paste button)."""
+        try:
+            from PIL import ImageGrab
+        except ImportError:
+            messagebox.showinfo("Paste image",
+                                "Pasting from the clipboard needs Pillow.\n\n"
+                                "Install it with:\n    pip install pillow")
+            return
+        try:
+            grab = ImageGrab.grabclipboard()
+        except Exception as e:
+            messagebox.showerror("img2cad", f"Could not read the clipboard:\n{e}")
+            return
+        if isinstance(grab, list):                     # a file was copied, not a bitmap
+            files = [p for p in grab if p.lower().endswith(
+                (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp"))]
+            if files:
+                self.load(files[0]); return
+            grab = None
+        if grab is None:
+            messagebox.showinfo("Paste image",
+                                "No image on the clipboard.\n\n"
+                                "Copy an image (or use the Windows snipping tool) and try again.")
+            return
+        tmp = os.path.join(tempfile.gettempdir(), "img2cad_clipboard.png")
+        try:
+            grab.convert("RGBA").save(tmp)
+        except Exception as e:
+            messagebox.showerror("img2cad", f"Could not save the pasted image:\n{e}")
+            return
+        self._mask_cache = None       # same path re-pasted must re-decode
+        self.load(tmp)
+        self._flash("Pasted image from clipboard")
+
+    def apply_preset(self, *_):
+        """Apply the named PRESET recipe to MODE + TUNING, then recompute."""
+        name = self.preset.get()
+        rec = PRESETS.get(name)
+        if not rec:                    # "Custom" — nothing to apply
+            return
+        self._applying = True
+        self.fit.set(rec["fit"]); self.centerline.set(rec["centerline"])
+        self.canny.set(rec["canny"]); self.invert.set(rec["invert"])
+        self.simplify.set(rec["simplify"]); self.dejag.set(rec["dejag"])
+        self.weldval.set(rec["weldval"]); self.filletval.set(rec["filletval"])
+        self.minarea.set(rec["minarea"])
+        self._sync_labels()
+        self._applying = False
+        self._flash(f"Preset: {name}")
+        if self.path:
+            self.recompute()
+        self._save_prefs()
+
     def auto(self):
         """Auto-adjust ONLY the tuning sliders (not MODE, not Fillet)."""
         if not self.path:
@@ -553,9 +697,41 @@ class App:
             messagebox.showerror("img2cad", f"Could not process image:\n{e}")
             return
         self.base_img = (cv2.cvtColor(self.mask, cv2.COLOR_GRAY2BGR) * 0.22).astype(np.uint8)
+        self._update_audit(opt)
         self._rebuild_display()
         self._refresh_scale_fields()
         self._blit()
+
+    def _update_audit(self, opt):
+        """Build the DXF in memory and surface entity count + audit status."""
+        try:
+            h, w = self.mask.shape[:2]
+            _, errs = core.audit_items(self.items, opt, h, w)
+        except Exception:
+            self.audit_txt = ""
+            self.audit_lbl.config(text="", foreground=T["muted"])
+            return
+        n = sum(self.tally.values())
+        ng = len(self.gap_pts)
+        # Centerline strokes legitimately have open ends, so don't flag them as a
+        # fault there — only real ezdxf audit errors warn in that mode.
+        gap_is_fault = ng > 0 and not opt.centerline
+        if errs == 0 and not gap_is_fault:
+            self.audit_txt = "0 audit errors ✓"
+            col = T["accent"]
+            badge = f"{n} entities · 0 audit errors ✓"
+            if opt.centerline and ng:               # informational, not a warning
+                badge += f"  ({ng} open end" + ("s" if ng != 1 else "") + ")"
+        else:
+            bits = []
+            if errs:
+                bits.append(f"{errs} audit error" + ("s" if errs != 1 else ""))
+            if gap_is_fault:
+                bits.append(f"{ng} open gap" + ("s" if ng != 1 else ""))
+            self.audit_txt = " · ".join(bits) + " ⚠"
+            col = "#f0a850"
+            badge = f"{n} entities · " + self.audit_txt
+        self.audit_lbl.config(text=badge, foreground=col)
 
     def _get_mask(self, opt):
         """Binarize, caching on just the params that affect the mask (sliders don't)."""
@@ -582,6 +758,12 @@ class App:
                              for pts in items if len(pts) >= 2]
             self.tally = Counter({"spline": len(self.draw_img)})
         self.bounds = core.geometry_bounds(items, self.is_prim)
+        # Open endpoints that welding didn't close = potential "won't extrude" seams.
+        if self.is_prim:
+            gap_tol = max(float(self.weldval.get()), 1.0) * 1.5
+            self.gap_pts = core.open_endpoints(items, gap_tol)
+        else:
+            self.gap_pts = np.empty((0, 2))
 
     def _rebuild_display(self):
         """Rotate the base image + geometry into display space so the preview is WYSIWYG."""
@@ -615,6 +797,7 @@ class App:
         self.ddraw = [{"kind": d["kind"], "closed": d["closed"], "pts": tr(d["pts"]),
                        "ends": tr(d["ends"]) if len(d["ends"]) else d["ends"]}
                       for d in self.draw_img]
+        self.dgaps = tr(self.gap_pts) if len(self.gap_pts) else np.empty((0, 2))
         self.dw, self.dh = nw, nh
         self.dimgbox = (0.0, 0.0, float(nw), float(nh))
         # Recalculate the box as the AABB of the *rotated* geometry (don't tilt it).
@@ -663,6 +846,11 @@ class App:
                     px, py = np.round(np.asarray(e) * eff - off).astype(int)
                     cv2.circle(frame, (int(px), int(py)), 3, (255, 255, 255), -1, cv2.LINE_AA)
                     cv2.circle(frame, (int(px), int(py)), 3, (30, 30, 30), 1, cv2.LINE_AA)
+        if self.show_gaps.get() and len(self.dgaps):
+            for g in self.dgaps:
+                px, py = np.round(np.asarray(g) * eff - off).astype(int)
+                cv2.circle(frame, (int(px), int(py)), 5, GAP_BGR, -1, cv2.LINE_AA)
+                cv2.circle(frame, (int(px), int(py)), 5, (255, 255, 255), 1, cv2.LINE_AA)
 
         ok, buf = cv2.imencode(".png", frame)
         if ok:
@@ -674,7 +862,8 @@ class App:
         parts = "  ".join(f"{v} {k}" for k, v in t.items()) or "nothing detected"
         head = f"{self._note}   ·   " if self._note else ""
         rot = f"  rot {int(self._rot_deg())}°" if self._rot_deg() else ""
-        self.status.config(text=f"{head}{sum(t.values())} entities: {parts}{rot}"
+        audit = f"   ·   {self.audit_txt}" if self.audit_txt else ""
+        self.status.config(text=f"{head}{sum(t.values())} entities: {parts}{rot}{audit}"
                                 f"   ·   zoom {self.zoom:.1f}×  (scroll=zoom · drag=pan · dbl-click=fit)")
 
     def _draw_guides(self, frame, eff, off):
@@ -735,14 +924,18 @@ class App:
         if not self.path or not self.items:
             return
         default = os.path.splitext(self.path)[0] + ".dxf"
-        out = filedialog.asksaveasfilename(defaultextension=".dxf",
-                                           initialfile=os.path.basename(default),
-                                           filetypes=[("DXF", "*.dxf")])
+        out = filedialog.asksaveasfilename(
+            defaultextension=".dxf",
+            initialfile=os.path.basename(default),
+            filetypes=[("DXF — Onshape sketch", "*.dxf"),
+                       ("SVG — laser / vector", "*.svg"),
+                       ("PDF — print / share", "*.pdf")])
         if not out:
             return
         # Rebuild geometry from the exact opt we're exporting with, so a pending
         # debounced recompute can't leave self.items in a shape that mismatches opt.
         opt = self._opts()
+        fmt = out.rsplit(".", 1)[-1].lower() if "." in os.path.basename(out) else "dxf"
         try:
             mask = self._get_mask(opt)
             items = core.build_items(mask, opt)
@@ -751,14 +944,15 @@ class App:
                                                   "Try Invert, Canny, or a lower 'Ignore specks'.")
                 return
             h, w = mask.shape[:2]
-            tally = core.write_dxf(items, out, opt, h, w)
+            tally = core.export_file(items, out, opt, h, w)
         except Exception as e:
-            messagebox.showerror("img2cad", f"Could not write DXF:\n{e}")
+            messagebox.showerror("img2cad", f"Could not write {fmt.upper()}:\n{e}")
             return
         breakdown = ", ".join(f"{v} {k}" for k, v in tally.items() if k != "total")
+        hint = ("\n\nIn Onshape: right-click a sketch plane → Import DXF/DWG."
+                if fmt == "dxf" else "")
         messagebox.showinfo("Saved",
-                            f"Wrote {tally.get('total', 0)} entities ({breakdown}) to:\n{out}\n\n"
-                            "In Onshape: right-click a sketch plane → Import DXF/DWG.")
+                            f"Wrote {tally.get('total', 0)} entities ({breakdown}) to:\n{out}{hint}")
 
 
 def _icon_path():
@@ -787,7 +981,12 @@ def main():
             pass
     App(root, initial)
     root.minsize(960, 640)
-    root.geometry("1240x940")   # tall enough that the sidebar fits without scrolling
+    # Fit the window to the screen so the pinned Export button is always reachable
+    # (the sidebar scrolls when taller). Leave room for the taskbar.
+    root.update_idletasks()
+    sh = root.winfo_screenheight()
+    h = max(640, min(940, sh - 80))
+    root.geometry(f"1240x{h}")
     root.mainloop()
 
 

@@ -15,6 +15,7 @@ optional smooth B-spline refit so you get as few, cleanest curves as possible.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from dataclasses import dataclass
 
@@ -318,6 +319,31 @@ def _endpoint_slots(prim: dict) -> list[tuple]:
     return [(prim["pts"], 0), (prim["pts"], -1)]   # line / spline arrays
 
 
+def _endpoint_index(prims: list[dict]):
+    """Flatten primitives to (slots, pts Nx2, prim_of) for spatial endpoint ops.
+
+    `prim_of[i]` is the index of the primitive that owns endpoint slot `i`, so
+    callers can tell a primitive's own two endpoints apart from a real neighbor.
+    """
+    slots, prim_of = [], []
+    for pi, p in enumerate(prims):
+        for s in _endpoint_slots(p):
+            slots.append(s)
+            prim_of.append(pi)
+    if not slots:
+        return [], np.empty((0, 2)), []
+    pts = np.array([np.asarray(c[k], dtype=float) for c, k in slots])
+    return slots, pts, prim_of
+
+
+def _grid_buckets(pts: np.ndarray, inv: float) -> dict:
+    """Bucket point indices into a uniform grid of cell size 1/inv (spatial index)."""
+    buckets: dict[tuple, list[int]] = {}
+    for i, (x, y) in enumerate(pts):
+        buckets.setdefault((int(np.floor(x * inv)), int(np.floor(y * inv))), []).append(i)
+    return buckets
+
+
 def weld_endpoints(prims: list[dict], tol: float) -> int:
     """Snap endpoints within `tol` px to a shared point (union-find over a grid).
 
@@ -327,11 +353,10 @@ def weld_endpoints(prims: list[dict], tol: float) -> int:
     """
     if tol <= 0:
         return 0
-    slots = [s for p in prims for s in _endpoint_slots(p)]
-    if not slots:
-        return 0
-    pts = np.array([np.asarray(c[k], dtype=float) for c, k in slots])
+    slots, pts, _ = _endpoint_index(prims)
     n = len(pts)
+    if n == 0:
+        return 0
     parent = list(range(n))
 
     def find(i):
@@ -341,9 +366,7 @@ def weld_endpoints(prims: list[dict], tol: float) -> int:
         return i
 
     inv = 1.0 / tol
-    buckets: dict[tuple, list[int]] = {}
-    for i, (x, y) in enumerate(pts):
-        buckets.setdefault((int(np.floor(x * inv)), int(np.floor(y * inv))), []).append(i)
+    buckets = _grid_buckets(pts, inv)
     t2 = tol * tol
     for i, (x, y) in enumerate(pts):
         bx, by = int(np.floor(x * inv)), int(np.floor(y * inv))
@@ -549,6 +572,46 @@ def _chain_is_closed(prims: list[dict], tol: float = 1e-6) -> bool:
     return bool(np.hypot(*(a[0] - b[-1])) <= tol)
 
 
+def open_endpoints(items: list, tol: float) -> np.ndarray:
+    """Endpoints that don't meet another primitive's endpoint within `tol` px.
+
+    These are the open seams Onshape won't auto-join (so a profile can't be
+    extruded). Returns an (N,2) array of such points in image coords, so the GUI
+    can flag them in red. A slightly larger `tol` than `weld` is used by callers
+    to only warn about gaps that welding *didn't* already close.
+    """
+    prims = [p for lst in items for p in lst]
+    slots, pts, prim_of = _endpoint_index(prims)
+    n = len(pts)
+    if n == 0:
+        return np.empty((0, 2))
+    r = max(tol, 1e-6)
+    inv = 1.0 / r
+    buckets = _grid_buckets(pts, inv)
+    t2 = r * r
+    open_pts = []
+    for i, (x, y) in enumerate(pts):
+        bx, by = int(np.floor(x * inv)), int(np.floor(y * inv))
+        met = False
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for j in buckets.get((bx + dx, by + dy), ()):
+                    # A primitive's own two endpoints don't "meet" each other:
+                    # skip self (j==i) and the sibling endpoint of the same prim.
+                    if j != i and prim_of[j] != prim_of[i]:
+                        dxy = pts[i] - pts[j]
+                        if dxy @ dxy <= t2:
+                            met = True
+                            break
+                if met:
+                    break
+            if met:
+                break
+        if not met:
+            open_pts.append(pts[i])
+    return np.array(open_pts) if open_pts else np.empty((0, 2))
+
+
 def geometry_bounds(items: list, is_primitive: bool) -> tuple | None:
     """(minx, miny, maxx, maxy) over all geometry in image coords, or None."""
     pts = []
@@ -712,10 +775,12 @@ def make_transform(opt: Options, img_h: int, img_w: int):
     return tf, sx, sy
 
 
-def write_dxf(items: list, out: str, opt: Options, img_h: int, img_w: int) -> dict:
-    """Write a DXF. `items` is a list of primitive-lists or (legacy) point-arrays.
+def build_doc(items: list, opt: Options, img_h: int, img_w: int):
+    """Build the ezdxf document (without saving). Returns (doc, tally).
 
-    Returns a tally, e.g. {"line": 8, "arc": 3, "spline": 1, "total": 12}.
+    `items` is a list of primitive-lists or (legacy) point-arrays. The tally looks
+    like {"line": 8, "arc": 3, "spline": 1, "total": 12}. Split out from write_dxf
+    so the GUI can audit the geometry live without touching disk.
     """
     tf, sx, sy = make_transform(opt, img_h, img_w)
     uniform = abs(sx - sy) <= 1e-6 * max(sx, sy, 1.0)
@@ -751,9 +816,26 @@ def write_dxf(items: list, out: str, opt: Options, img_h: int, img_w: int) -> di
     if opt.export_bbox or opt.export_centerlines:
         _emit_guides(doc, msp, output_bounds(items, is_prim, tf, opt, img_w, img_h), opt, bump)
 
-    doc.saveas(out)
     tally["total"] = sum(tally.values())
+    return doc, tally
+
+
+def write_dxf(items: list, out: str, opt: Options, img_h: int, img_w: int) -> dict:
+    """Write a DXF and return the entity tally."""
+    doc, tally = build_doc(items, opt, img_h, img_w)
+    doc.saveas(out)
     return tally
+
+
+def audit_items(items: list, opt: Options, img_h: int, img_w: int) -> tuple[dict, int]:
+    """Build the DXF in memory and run ezdxf's structural auditor.
+
+    Returns (tally, error_count). A clean DXF audits with 0 errors; anything else
+    is what Onshape may reject, so the GUI surfaces this before export.
+    """
+    doc, tally = build_doc(items, opt, img_h, img_w)
+    errors = len(doc.audit().errors)
+    return tally, errors
 
 
 def _emit_primitive(msp, pr: dict, tf, sx: float, uniform: bool, bump, layer: str = "0") -> None:
@@ -800,6 +882,28 @@ def output_bounds(items, is_prim, tf, opt: Options, img_w, img_h):
     return float(c[:, 0].min()), float(c[:, 1].min()), float(c[:, 0].max()), float(c[:, 1].max())
 
 
+def _guide_polylines(bounds, opt: Options):
+    """Guide geometry (bbox + crosshairs) as (kind, pts, closed) in output coords.
+
+    Mirrors `_emit_guides` so SVG/PDF honor --export-bbox / --export-centerlines
+    instead of silently dropping them (DXF gets real dashed layers; SVG/PDF get
+    plain lines).
+    """
+    if bounds is None:
+        return []
+    x0, y0, x1, y1 = bounds
+    out = []
+    if opt.export_bbox:
+        c = [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]
+        for a, b in zip(c[:-1], c[1:]):
+            out.append(("line", np.array([a, b], float), False))
+    if opt.export_centerlines:
+        cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        out.append(("line", np.array([(cx, y0), (cx, y1)], float), False))
+        out.append(("line", np.array([(x0, cy), (x1, cy)], float), False))
+    return out
+
+
 def _emit_guides(doc, msp, bounds, opt: Options, bump) -> None:
     """Add an axis-aligned bounding box and/or center cross-hairs (own dashed layers).
 
@@ -822,6 +926,154 @@ def _emit_guides(doc, msp, bounds, opt: Options, bump) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# SVG / PDF output  (same primitive list -> vector formats for laser / sharing)
+# --------------------------------------------------------------------------- #
+UNIT_TO_MM = {"mm": 1.0, "cm": 10.0, "m": 1000.0, "in": 25.4, "px": 25.4 / 96.0}
+
+
+def _iter_polylines(items: list, opt: Options, tf):
+    """Yield each primitive as (kind, transformed points, closed) for SVG/PDF.
+
+    Lines and circles keep their identity (so SVG can emit exact <line>/<circle>);
+    everything else is sampled to a polyline. Points are already in output coords.
+    """
+    is_prim = opt.fit or opt.centerline
+    if not is_prim:
+        for pts in items:
+            if len(pts) >= 2:
+                yield "spline", tf(np.asarray(pts, float)), not opt.canny
+        return
+    for prims in items:
+        for pr in prims:
+            k = pr["kind"]
+            if k == "line":
+                yield "line", tf(pr["pts"]), False
+            elif k == "circle":
+                yield "circle", tf(primitive_points(pr)), True
+            else:  # arc / spline
+                yield "spline", tf(primitive_points(pr)), False
+
+
+def _output_extent(polys):
+    allp = np.vstack([p for _, p, _ in polys])
+    return float(allp[:, 0].min()), float(allp[:, 1].min()), \
+        float(allp[:, 0].max()), float(allp[:, 1].max())
+
+
+def write_svg(items: list, out: str, opt: Options, img_h: int, img_w: int) -> dict:
+    """Emit an SVG of the same geometry (real-world sized via the unit label)."""
+    tf, sx, sy = make_transform(opt, img_h, img_w)
+    uniform = abs(sx - sy) <= 1e-6 * max(sx, sy, 1.0)
+    polys = list(_iter_polylines(items, opt, tf))
+    if not polys:
+        raise SystemExit("no geometry to export")
+    if opt.export_bbox or opt.export_centerlines:
+        polys += _guide_polylines(
+            output_bounds(items, opt.fit or opt.centerline, tf, opt, img_w, img_h), opt)
+    x0, y0, x1, y1 = _output_extent(polys)
+    w, h = max(x1 - x0, 1e-6), max(y1 - y0, 1e-6)
+    # Output space is CAD y-up; SVG is y-down -> map Y = (y1 - y).
+    def X(v): return v - x0
+    def Y(v): return y1 - v
+
+    sw = max(w, h) * 0.003        # hairline-ish stroke that scales with the drawing
+    u = opt.units if opt.units in UNIT_TO_MM else "mm"
+    body = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w:.4f}{u}" '
+            f'height="{h:.4f}{u}" viewBox="0 0 {w:.4f} {h:.4f}">',
+            f'<g fill="none" stroke="#000" stroke-width="{sw:.4f}" '
+            'stroke-linecap="round" stroke-linejoin="round">']
+    tally: dict[str, int] = {}
+
+    def bump(k):
+        tally[k] = tally.get(k, 0) + 1
+
+    for kind, pts, closed in polys:
+        if kind == "line":
+            a, b = pts[0], pts[-1]
+            body.append(f'<line x1="{X(a[0]):.4f}" y1="{Y(a[1]):.4f}" '
+                        f'x2="{X(b[0]):.4f}" y2="{Y(b[1]):.4f}"/>'); bump("line")
+        elif kind == "circle" and uniform:
+            cx, cy = pts.mean(axis=0)
+            r = float(np.hypot(*(pts[0] - [cx, cy])))
+            body.append(f'<circle cx="{X(cx):.4f}" cy="{Y(cy):.4f}" r="{r:.4f}"/>'); bump("circle")
+        else:
+            d = " ".join(f"{X(px):.4f},{Y(py):.4f}" for px, py in pts)
+            tag = "polygon" if closed else "polyline"
+            body.append(f'<{tag} points="{d}"/>'); bump("spline" if kind != "circle" else "circle")
+    body.append("</g></svg>")
+    with open(out, "w", encoding="utf-8") as f:
+        f.write("\n".join(body))
+    tally["total"] = sum(tally.values())
+    return tally
+
+
+def write_pdf(items: list, out: str, opt: Options, img_h: int, img_w: int) -> dict:
+    """Emit a minimal single-page vector PDF (flattened polylines, real size)."""
+    tf, _, _ = make_transform(opt, img_h, img_w)
+    polys = [(k, p) for k, p, _ in _iter_polylines(items, opt, tf)]
+    if not polys:
+        raise SystemExit("no geometry to export")
+    if opt.export_bbox or opt.export_centerlines:
+        polys += [(k, p) for k, p, _ in _guide_polylines(
+            output_bounds(items, opt.fit or opt.centerline, tf, opt, img_w, img_h), opt)]
+    all_pts = [p for _, p in polys]
+    allp = np.vstack(all_pts)
+    x0, y0 = allp[:, 0].min(), allp[:, 1].min()
+    x1, y1 = allp[:, 0].max(), allp[:, 1].max()
+    ppu = 72.0 * UNIT_TO_MM.get(opt.units, 1.0) / 25.4   # points per output unit
+    m = 10.0                                             # margin (pt)
+    W = (x1 - x0) * ppu + 2 * m
+    H = (y1 - y0) * ppu + 2 * m
+
+    def px(v): return (v - x0) * ppu + m
+    def py(v): return (v - y0) * ppu + m               # PDF is y-up, like our coords
+
+    ops = ["0.5 w", "0 0 0 RG"]
+    tally: dict[str, int] = {}
+    for kind, pts in polys:
+        tally[kind if kind in ("line", "circle") else "spline"] = \
+            tally.get(kind if kind in ("line", "circle") else "spline", 0) + 1
+        ops.append(f"{px(pts[0][0]):.3f} {py(pts[0][1]):.3f} m")
+        for p in pts[1:]:
+            ops.append(f"{px(p[0]):.3f} {py(p[1]):.3f} l")
+        ops.append("S")
+    stream = "\n".join(ops).encode("latin-1")
+
+    objs = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {W:.2f} {H:.2f}] "
+        f"/Contents 4 0 R /Resources << >> >>".encode("latin-1"),
+        b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream",
+    ]
+    out_bytes = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for i, body in enumerate(objs, start=1):
+        offsets.append(len(out_bytes))
+        out_bytes += b"%d 0 obj\n" % i + body + b"\nendobj\n"
+    xref_pos = len(out_bytes)
+    out_bytes += b"xref\n0 %d\n" % (len(objs) + 1)
+    out_bytes += b"0000000000 65535 f \n"
+    for off in offsets:
+        out_bytes += b"%010d 00000 n \n" % off
+    out_bytes += (b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF"
+                  % (len(objs) + 1, xref_pos))
+    with open(out, "wb") as f:
+        f.write(out_bytes)
+    tally["total"] = sum(tally.values())
+    return tally
+
+
+def export_file(items: list, out: str, opt: Options, img_h: int, img_w: int,
+                fmt: str | None = None) -> dict:
+    """Write DXF / SVG / PDF. Explicit `fmt` wins; else infer from `out`'s extension."""
+    if not fmt:
+        fmt = out.rsplit(".", 1)[-1].lower() if "." in os.path.basename(out) else "dxf"
+    writer = {"svg": write_svg, "pdf": write_pdf}.get(fmt, write_dxf)
+    return writer(items, out, opt, img_h, img_w)
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 def build_parser() -> argparse.ArgumentParser:
@@ -829,8 +1081,12 @@ def build_parser() -> argparse.ArgumentParser:
         prog="img2cad",
         description="Detect edges in a PNG and export a clean DXF for Onshape.",
     )
-    p.add_argument("input", help="input image (png/jpg/...)")
-    p.add_argument("-o", "--output", default=None, help="output .dxf (default: <input>.dxf)")
+    p.add_argument("input", nargs="+",
+                   help="input image(s) or folder(s) — batch-converts each one")
+    p.add_argument("-o", "--output", default=None,
+                   help="output file (single input) or output folder (multiple inputs)")
+    p.add_argument("--format", default=None, choices=["dxf", "svg", "pdf"],
+                   help="output format (default: infer from -o, else dxf)")
 
     g = p.add_argument_group("detection")
     g.add_argument("--canny", action="store_true", help="trace outline edges instead of filled shapes")
@@ -905,23 +1161,107 @@ def options_from_args(a: argparse.Namespace) -> Options:
     )
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    opt = options_from_args(args)
-    out = args.output or (args.input.rsplit(".", 1)[0] + ".dxf")
+_IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp")
 
-    mask = load_binary(args.input, opt)
+
+def _expand_inputs(inputs: list[str]) -> list[str]:
+    """Expand any folders in the input list into the image files they contain."""
+    import os
+    files: list[str] = []
+    for item in inputs:
+        if os.path.isdir(item):
+            for name in sorted(os.listdir(item)):
+                if name.lower().endswith(_IMG_EXTS):
+                    files.append(os.path.join(item, name))
+        else:
+            files.append(item)
+    return files
+
+
+def _convert_one(path: str, out: str, opt: Options, fmt: str) -> int:
+    """Convert a single image to `out`. Returns entity count (0 = nothing found)."""
+    mask = load_binary(path, opt)
     h, w = mask.shape[:2]
     items = build_items(mask, opt)
     if not any(items):
-        print("nothing found - try --invert, --canny, or a lower --min-area", file=sys.stderr)
-        return 2
-    tally = write_dxf(items, out, opt, h, w)
-
+        return 0
+    tally = export_file(items, out, opt, h, w, fmt)
     breakdown = ", ".join(f"{v} {k}" for k, v in tally.items() if k != "total")
     print(f"ok: {tally['total']} entities ({breakdown}) -> {out}")
-    print(f"    import into Onshape: sketch a plane, right-click > Import DXF/DWG > pick {out}")
-    return 0
+    return tally["total"]
+
+
+_FMT_EXTS = ("dxf", "svg", "pdf")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    opt = options_from_args(args)
+    inputs = _expand_inputs(args.input)
+    if not inputs:
+        print("no images found", file=sys.stderr)
+        return 2
+
+    out = args.output
+    out_ext = (os.path.basename(out).rsplit(".", 1)[-1].lower()
+               if out and "." in os.path.basename(out) else "")
+    # -o names a single output FILE when it carries a known format extension and
+    # isn't an existing directory; otherwise it's an output folder.
+    out_is_file = bool(out) and out_ext in _FMT_EXTS and not os.path.isdir(out)
+
+    # Format precedence: --format, else the -o file extension, else dxf.
+    fmt = args.format or (out_ext if out_ext in _FMT_EXTS else "") or "dxf"
+
+    if out_is_file and len(inputs) > 1:
+        print(f"error: -o {out!r} names a single file but {len(inputs)} inputs were "
+              "given; pass an output folder or drop -o", file=sys.stderr)
+        return 2
+
+    out_is_dir = bool(out) and not out_is_file
+    if out_is_dir:
+        if os.path.exists(out) and not os.path.isdir(out):
+            print(f"error: -o {out!r} exists and is not a directory", file=sys.stderr)
+            return 2
+        os.makedirs(out, exist_ok=True)
+
+    used: set[str] = set()
+
+    def _join(folder: str, name: str) -> str:
+        return os.path.join(folder, name) if folder else name
+
+    def out_path(src: str) -> str:
+        if out_is_file:                             # single explicit output file
+            return out
+        stem = os.path.basename(src).rsplit(".", 1)[0]
+        folder = out if out_is_dir else os.path.dirname(src)
+        p = _join(folder, f"{stem}.{fmt}")
+        # De-collide same-named inputs from different folders (a.dxf, a-2.dxf, ...).
+        i = 2
+        while p in used:
+            p = _join(folder, f"{stem}-{i}.{fmt}")
+            i += 1
+        used.add(p)
+        return p
+
+    batch = len(inputs) > 1
+    made = 0
+    for src in inputs:
+        try:
+            n = _convert_one(src, out_path(src), opt, fmt)
+        except SystemExit as e:
+            print(f"skip {src}: {e}", file=sys.stderr)
+            continue
+        except Exception as e:                      # isolate per-file failures in a batch
+            print(f"skip {src}: {type(e).__name__}: {e}", file=sys.stderr)
+            continue
+        if n == 0:
+            print(f"nothing found in {src} - try --invert, --canny, or lower --min-area",
+                  file=sys.stderr)
+        else:
+            made += 1
+    if made and not batch and fmt == "dxf":
+        print("    import into Onshape: sketch a plane, right-click > Import DXF/DWG")
+    return 0 if made else 2
 
 
 if __name__ == "__main__":
