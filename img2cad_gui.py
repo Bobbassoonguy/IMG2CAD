@@ -29,6 +29,7 @@ import cv2
 import numpy as np
 
 import img2cad as core
+import theme
 
 MIN_ZOOM, MAX_ZOOM = 1.0, 12.0
 UNIT_MM = {"mm": 1.0, "cm": 10.0, "in": 25.4, "m": 1000.0}   # mm per output unit
@@ -68,21 +69,19 @@ TOOLS = [
 MODE_NAMES = {"pan": "pan", "crop": "detection-area", "brush": "brush",
               "pick": "color-pick", "measure": "measure"}
 
-# "Slate + Teal" palette - simple, cool, and it lets the geometry colors pop.
-T = {
-    "bg": "#0f131a", "panel": "#171d27", "elevated": "#222b38", "line": "#2c3644",
-    "text": "#e7ecf4", "muted": "#8593a6", "accent": "#2dd4bf", "accent_hi": "#5eead4",
-    "ink": "#04120f", "canvas": "#0b0e13",
-}
-COLORS = {"line": (1, 179, 245), "arc": (238, 211, 34),
-          "circle": (128, 222, 74), "spline": (249, 121, 232)}
-GAP_BGR = (60, 60, 255)           # red for open/un-welded endpoints (BGR)
-CANVAS_BGR = (19, 14, 11)
-GUIDE_BOX = (150, 150, 150)       # faint gray for the bounding box
-GUIDE_CTR = (180, 190, 120)       # faint teal for the centerlines
-CROP_BGR = (90, 200, 255)         # amber crop rectangle
-HILITE_BGR = (150, 235, 90)       # teal-green wash over detected pixels
-MEAS_BGR = (80, 180, 255)         # orange for measure lines
+# All colour + type comes from theme.py (single source of truth — see docs/THEME.md).
+T = theme.T                       # semantic UI ramp (dark, teal on jet-black)
+COLORS = theme.GEOMETRY_BGR       # per-entity draw colours (BGR for OpenCV)
+WARN = theme.STATUS["warn"]       # amber for audit / "no effect" notes
+GAP_BGR = theme.GAP_BGR           # red open/un-welded endpoints
+CANVAS_BGR = theme.CANVAS_BGR
+GUIDE_BOX = theme.GUIDE_BOX
+GUIDE_CTR = theme.GUIDE_CTR
+CROP_BGR = theme.CROP_BGR
+HILITE_BGR = theme.HILITE_BGR
+MEAS_BGR = theme.MEAS_BGR
+FONTS = theme.FONTS
+SIZES = theme.SIZES
 
 
 def _hex(bgr):
@@ -160,6 +159,53 @@ class LengthDialog(simpledialog.Dialog):
         self.result = (self._v, self.unit.get())
 
 
+class Tooltip:
+    """A small delayed hover tooltip — Tkinter ships none. Themed from theme.T."""
+    def __init__(self, widget, text, delay=450, wrap=250):
+        self.widget = widget; self.text = text; self.delay = delay; self.wrap = wrap
+        self._after = None; self._tip = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _=None):
+        self._cancel()
+        self._after = self.widget.after(self.delay, self._show)
+
+    def _cancel(self):
+        if self._after is not None:
+            try:
+                self.widget.after_cancel(self._after)
+            except Exception:
+                pass
+            self._after = None
+
+    def _show(self):
+        if self._tip is not None or not self.text:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 16
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        except Exception:
+            return
+        self._tip = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        tw.configure(background=T["line"])
+        tk.Label(tw, text=self.text, justify="left", wraplength=self.wrap,
+                 background=T["elevated"], foreground=T["text"],
+                 font=(FONTS["body"], SIZES["sub"]), padx=8, pady=5, bd=0).pack(padx=1, pady=1)
+
+    def _hide(self, _=None):
+        self._cancel()
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except Exception:
+                pass
+            self._tip = None
+
+
 class App:
     def __init__(self, root, initial=None):
         self.root = root
@@ -193,6 +239,8 @@ class App:
         self._applying = False            # guard: applying a preset shouldn't flip to Custom
         self._note = ""
         self._sliders = []
+        self.active_step = 0              # which step-rail panel is showing
+        self._scale_user = False          # user has explicitly set a real-world size
         self.tw_mm = None
         self.th_mm = None
         self._editing = False
@@ -234,7 +282,8 @@ class App:
         data = {"units": self.units.get(), "reference": self.reference.get(),
                 "lock": self.lock.get(), "rot": self.rot.get(),
                 "show_guides": self.show_guides.get(), "exp_bbox": self.exp_bbox.get(),
-                "exp_center": self.exp_center.get()}
+                "exp_center": self.exp_center.get(),
+                "active_step": getattr(self, "active_step", 0)}
         try:
             data.update({
                 "preset": self.preset.get(),
@@ -246,7 +295,11 @@ class App:
                 "minarea": self.minarea.get(), "merge": self.merge.get(),
                 "thresh_mode": self.thresh_mode.get(), "coltol": self.coltol.get(),
                 "brush": self.brush.get(), "bg_view": self.bg_view.get(),
-                "highlight": self.highlight.get(),
+                "highlight": self.highlight.get(), "threshval": self.threshval.get(),
+                "blur": self.blurval.get(), "corner": self.cornerval.get(),
+                "extonly": self.extonly.get(), "aspoly": self.aspoly.get(),
+                "adablock": self.adablock.get(), "adac": self.adac.get(),
+                "out_fmt": self.out_fmt.get(),
             })
         except AttributeError:      # called before all widgets exist
             pass
@@ -261,39 +314,47 @@ class App:
 
     # -- theme ------------------------------------------------------------ #
     def _apply_theme(self):
+        import tkinter.font as tkfont
+        fams = set(tkfont.families())
+        # The drafting-style display face if installed, else a safe fallback.
+        disp = FONTS["display"] if FONTS["display"] in fams else FONTS["display_fallback"]
+        self._font_disp = disp
+        body, bodyb, mono = FONTS["body"], FONTS["body_bold"], FONTS["mono"]
         st = ttk.Style(); st.theme_use("clam")
         st.configure(".", background=T["panel"], foreground=T["text"],
                      bordercolor=T["line"], focuscolor=T["panel"])
         for name, bg in [("Sidebar.TFrame", T["panel"]), ("Canvas.TFrame", T["canvas"]),
-                         ("Bar.TFrame", T["bg"]), ("Tool.TFrame", T["bg"])]:
+                         ("Bar.TFrame", T["bg"]), ("Tool.TFrame", T["bg"]),
+                         ("Rail.TFrame", T["bg"])]:
             st.configure(name, background=bg)
         st.configure("TLabel", background=T["panel"], foreground=T["text"])
-        st.configure("Title.TLabel", foreground=T["text"], font=("Segoe UI Semibold", 15))
-        st.configure("Sub.TLabel", foreground=T["muted"], font=("Segoe UI", 9))
-        st.configure("Section.TLabel", foreground=T["accent"], font=("Segoe UI", 8, "bold"))
-        st.configure("Step.TLabel", foreground=T["text"], font=("Segoe UI Semibold", 10))
-        st.configure("Field.TLabel", foreground=T["text"], font=("Segoe UI", 9))
-        st.configure("Value.TLabel", foreground=T["accent"], font=("Consolas", 9))
-        st.configure("Read.TLabel", foreground=T["muted"], font=("Consolas", 8))
-        st.configure("Hint.TLabel", background=T["bg"], foreground=T["muted"], font=("Segoe UI", 9))
-        st.configure("Status.TLabel", background=T["bg"], foreground=T["muted"], font=("Segoe UI", 9))
+        st.configure("Title.TLabel", foreground=T["text"], font=(disp, SIZES["title"]))
+        st.configure("Sub.TLabel", foreground=T["muted"], font=(body, SIZES["sub"]))
+        st.configure("Desc.TLabel", foreground=T["muted"], font=(body, SIZES["sub"]))
+        st.configure("Section.TLabel", foreground=T["accent"], font=(disp, SIZES["section"]))
+        st.configure("Step.TLabel", foreground=T["text"], font=(disp, SIZES["step"]))
+        st.configure("Field.TLabel", foreground=T["text"], font=(body, SIZES["field"]))
+        st.configure("Value.TLabel", foreground=T["accent"], font=(mono, SIZES["value"]))
+        st.configure("Read.TLabel", foreground=T["muted"], font=(mono, SIZES["read"]))
+        st.configure("Hint.TLabel", background=T["bg"], foreground=T["muted"], font=(body, SIZES["hint"]))
+        st.configure("Status.TLabel", background=T["bg"], foreground=T["muted"], font=(body, SIZES["status"]))
         st.configure("TCheckbutton", background=T["panel"], foreground=T["text"],
-                     focuscolor=T["panel"], font=("Segoe UI", 9))
+                     focuscolor=T["panel"], font=(body, SIZES["field"]))
         st.map("TCheckbutton", background=[("active", T["panel"])],
                indicatorcolor=[("selected", T["accent"]), ("!selected", T["elevated"])],
-               foreground=[("active", T["text"])])
+               foreground=[("active", T["text"]), ("disabled", T["line"])])
         st.configure("TButton", background=T["elevated"], foreground=T["text"],
-                     bordercolor=T["line"], relief="flat", padding=(10, 7), font=("Segoe UI", 9))
+                     bordercolor=T["line"], relief="flat", padding=(10, 7), font=(body, SIZES["field"]))
         st.map("TButton", background=[("active", T["line"]), ("pressed", T["line"])])
         st.configure("Accent.TButton", background=T["accent"], foreground=T["ink"],
-                     font=("Segoe UI Semibold", 9), padding=(10, 8))
+                     font=(bodyb, SIZES["field"]), padding=(10, 8))
         st.map("Accent.TButton", background=[("active", T["accent_hi"]), ("pressed", T["accent_hi"])])
         # Canvas-toolbar tool buttons: flat on the dark bar, teal when active.
         st.configure("Tool.TButton", background=T["bg"], foreground=T["text"],
-                     bordercolor=T["line"], relief="flat", padding=(9, 5), font=("Segoe UI", 9))
+                     bordercolor=T["line"], relief="flat", padding=(9, 5), font=(body, SIZES["field"]))
         st.map("Tool.TButton", background=[("active", T["elevated"]), ("pressed", T["elevated"])])
         st.configure("ToolOn.TButton", background=T["accent"], foreground=T["ink"],
-                     relief="flat", padding=(9, 5), font=("Segoe UI Semibold", 9))
+                     relief="flat", padding=(9, 5), font=(bodyb, SIZES["field"]))
         st.map("ToolOn.TButton", background=[("active", T["accent_hi"]), ("pressed", T["accent_hi"])])
         st.configure("Horizontal.TScale", background=T["panel"], troughcolor=T["elevated"],
                      bordercolor=T["line"], lightcolor=T["accent"], darkcolor=T["accent"])
@@ -316,58 +377,86 @@ class App:
             self.root.option_add(opt, val)
 
     # -- layout ----------------------------------------------------------- #
+    # The sidebar is a numbered vertical STEP RAIL (①Source ②Prepare ③Trace
+    # ④Scale ⑤Export): pick a step on the rail, its panel fills the column. Work
+    # top-to-bottom. Cross-cutting View filters + Legend live in a persistent
+    # footer; the audit badge + Export button stay pinned at the very bottom.
+    RAIL_STEPS = [("1", "Source"), ("2", "Prepare"), ("3", "Trace"),
+                  ("4", "Scale"), ("5", "Export")]
+    STEP_SUB = ["Bring an image in", "Make a clean black-and-white mask",
+                "Detect and fit clean geometry", "Set the true real-world size",
+                "Validate and write the file"]
+
     def _build_widgets(self):
         self.root.columnconfigure(1, weight=1)
         self.root.rowconfigure(0, weight=1)
 
-        outer = ttk.Frame(self.root, style="Sidebar.TFrame", width=300)
+        # Shared display vars (used by the footer, the panels, and _render_frame),
+        # created up front so build order can't leave a binding dangling.
+        self.show_pts = tk.BooleanVar(value=self._p("show_pts", True))
+        self.show_gaps = tk.BooleanVar(value=self._p("show_gaps", True))
+        self.show_guides = tk.BooleanVar(value=self._p("show_guides", True))
+        # Sidebar tool buttons register here (mode -> button) so _set_mode can
+        # restyle the active one wherever it lives.
+        self._tool_btns = {}
+
+        outer = ttk.Frame(self.root, style="Bar.TFrame", width=356)
         outer.grid(row=0, column=0, sticky="ns"); outer.grid_propagate(False)
 
-        # One opaque pinned frame (separator + audit badge + Export button), lifted
-        # above the scroll canvas so the taller-than-viewport sidebar can't bleed
-        # white through any seam (Windows Tk doesn't clip canvas-embedded windows).
+        # (1) Pinned bottom: audit badge + Export button. Lifted above everything
+        # so a taller-than-viewport panel can't bleed through (Tk won't clip a
+        # canvas-embedded window on Windows).
         savewrap = ttk.Frame(outer, style="Sidebar.TFrame")
         savewrap.pack(side="bottom", fill="x")
-        ttk.Separator(savewrap).pack(fill="x", padx=16)
+        ttk.Separator(savewrap).pack(fill="x")
         self.audit_lbl = ttk.Label(savewrap, text="", style="Read.TLabel", anchor="center")
         self.audit_lbl.pack(fill="x", padx=16, pady=(8, 5))
-        self.save_btn = ttk.Button(savewrap, text="Export…  (DXF · SVG · PDF)",
+        self.save_btn = ttk.Button(savewrap, text="Export…   DXF · SVG · PDF",
                                    style="Accent.TButton", command=self.save, state="disabled")
         self.save_btn.pack(fill="x", padx=16, pady=(0, 14))
-        self._pinned = (savewrap,)
 
-        sc = tk.Canvas(outer, background=T["panel"], highlightthickness=0, width=274)
-        vsb = ttk.Scrollbar(outer, orient="vertical", command=sc.yview, style="Vertical.TScrollbar")
+        # (2) Persistent footer: View filters + Legend (above the pinned area).
+        footwrap = ttk.Frame(outer, style="Sidebar.TFrame")
+        footwrap.pack(side="bottom", fill="x")
+        self._build_footer(footwrap)
+        self._pinned = (footwrap, savewrap)
+
+        # (3) Top region: rail | panel column.
+        body = ttk.Frame(outer, style="Bar.TFrame")
+        body.pack(side="top", fill="both", expand=True)
+
+        rail = ttk.Frame(body, style="Rail.TFrame", width=74)
+        rail.pack(side="left", fill="y"); rail.pack_propagate(False)
+        self._build_rail(rail)
+
+        col = ttk.Frame(body, style="Sidebar.TFrame")
+        col.pack(side="left", fill="both", expand=True)
+        head = ttk.Frame(col, style="Sidebar.TFrame", padding=(16, 14, 16, 4))
+        head.pack(side="top", fill="x")
+        ttk.Label(head, text="img2cad", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(head, text="image → Onshape DXF", style="Sub.TLabel").pack(anchor="w")
+
+        sc = tk.Canvas(col, background=T["panel"], highlightthickness=0)
+        vsb = ttk.Scrollbar(col, orient="vertical", command=sc.yview, style="Vertical.TScrollbar")
         sc.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y"); sc.pack(side="left", fill="both", expand=True)
         self._sc, self._vsb, self._vsb_shown = sc, vsb, True
-        side = ttk.Frame(sc, style="Sidebar.TFrame", padding=(16, 14))
-        sc.create_window((0, 0), window=side, anchor="nw", width=274)
-        side.bind("<Configure>", self._update_scroll)
-        sc.bind("<Configure>", self._update_scroll)
-        self._sidebar = side
+        host = ttk.Frame(sc, style="Sidebar.TFrame", padding=(16, 6, 16, 12))
+        self._host_win = sc.create_window((0, 0), window=host, anchor="nw")
+        host.bind("<Configure>", self._update_scroll)
+        sc.bind("<Configure>", self._on_host_canvas_configure)
+        self._sidebar = host
 
-        ttk.Label(side, text="img2cad", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(side, text="image → Onshape DXF", style="Sub.TLabel").pack(anchor="w")
-
-        # SOURCE
-        src = ttk.Frame(side, style="Sidebar.TFrame"); src.pack(fill="x", pady=(12, 0))
-        ttk.Button(src, text="Open image…", command=self.pick).pack(
-            side="left", fill="x", expand=True, padx=(0, 4))
-        ttk.Button(src, text="⎘ Paste", width=8, command=self.paste_clipboard).pack(side="left")
-
-        self._build_prepare(side)
-        self._build_trace(side)
-        self._build_scale_section(side)
-        self._build_display(side)
-
-        # LEGEND
-        self._section(side, "LEGEND")
-        leg = ttk.Frame(side, style="Sidebar.TFrame"); leg.pack(fill="x", pady=(0, 4))
-        for kind, bgr in list(COLORS.items()) + [("gap", GAP_BGR)]:
-            cell = ttk.Frame(leg, style="Sidebar.TFrame"); cell.pack(side="left", padx=(0, 8))
-            tk.Label(cell, text="■", fg=_hex(bgr), bg=T["panel"], font=("Segoe UI", 9)).pack(side="left")
-            ttk.Label(cell, text=kind, style="Sub.TLabel").pack(side="left", padx=(2, 0))
+        # Build the five step panels once (children of the host, packed one at a
+        # time by _show_step). Each _panel() adds a title + subtitle then calls
+        # the builder to fill it.
+        self.panels = {}
+        for i, builder in enumerate((self._panel_source, self._panel_prepare,
+                                     self._panel_trace, self._panel_scale,
+                                     self._panel_export)):
+            num, word = self.RAIL_STEPS[i]
+            self.panels[i] = self._panel(host, f"{'①②③④⑤'[i]} {word}",
+                                         self.STEP_SUB[i], builder)
 
         # Right: canvas toolbar + studio + status bar
         right = ttk.Frame(self.root, style="Bar.TFrame")
@@ -391,128 +480,409 @@ class App:
                                 style="Status.TLabel", padding=(12, 6))
         self.status.grid(row=2, column=0, sticky="ew")
 
-        self._bind_wheel(self._sidebar)
         self._bind_wheel(self._sc)
+        self._bind_wheel(footwrap)
         for w in self._pinned:
             w.lift()
 
         self.root.bind("<Control-v>", lambda e: self.paste_clipboard())
         self.root.bind("<Control-V>", lambda e: self.paste_clipboard())
+        self.root.bind("<Escape>", lambda e: self._set_mode("pan"))
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._set_mode("pan")
+        self._reveal_threshold()
+        self._show_step(int(self._p("active_step", 0)))
 
     def _build_toolbar(self, parent):
+        # The interaction TOOLS (detection area, brush, pick, measure) now live in
+        # the sidebar next to their settings. The toolbar keeps only the two view
+        # actions; pan is the default mode (drag/scroll), and Esc cancels any tool.
         bar = ttk.Frame(parent, style="Tool.TFrame", padding=(10, 8))
         bar.grid(row=0, column=0, sticky="ew")
-        self._tool_btns = {}
-        for label, mode, _cursor, _hint in TOOLS:
-            b = ttk.Button(bar, text=label, style="Tool.TButton",
-                           command=lambda m=mode: self._set_mode(m))
-            b.pack(side="left", padx=(0, 5))
-            self._tool_btns[mode] = b
-        ttk.Button(bar, text="⤢ Fit", style="Tool.TButton",
-                   command=self._reset_view).pack(side="left", padx=(8, 0))
+        ttk.Button(bar, text="⤢ Fit to full", style="Tool.TButton",
+                   command=self._reset_view).pack(side="left", padx=(0, 5))
+        ttk.Button(bar, text="⬚ Fit to area", style="Tool.TButton",
+                   command=self._fit_to_area).pack(side="left", padx=(0, 5))
         self.tool_hint = ttk.Label(bar, text="", style="Hint.TLabel")
         self.tool_hint.pack(side="left", padx=(12, 0))
 
-    # -- sidebar sections ------------------------------------------------- #
-    def _build_prepare(self, side):
-        self._step(side, "1 · PREPARE", "isolate what should be traced")
+    # -- step rail -------------------------------------------------------- #
+    def _build_rail(self, rail):
+        """The numbered process spine. Each cell = big numeral + word + a state
+        dot (○ empty · ● active · ✓ complete) that mirrors the real pipeline."""
+        self._rail_steps = []
+        for i, (num, word) in enumerate(self.RAIL_STEPS):
+            cell = tk.Frame(rail, background=T["bg"], cursor="hand2")
+            cell.pack(side="top", fill="x")
+            bar = tk.Frame(cell, background=T["bg"], width=3)
+            bar.pack(side="left", fill="y")
+            inner = tk.Frame(cell, background=T["bg"])
+            inner.pack(side="left", fill="x", expand=True, pady=9)
+            num_lbl = tk.Label(inner, text=num, background=T["bg"], foreground=T["muted"],
+                               font=(self._font_disp, SIZES["rail_num"]))
+            num_lbl.pack()
+            word_lbl = tk.Label(inner, text=word, background=T["bg"], foreground=T["muted"],
+                                font=(FONTS["body"], SIZES["rail_lbl"]))
+            word_lbl.pack()
+            dot_lbl = tk.Label(inner, text="○", background=T["bg"], foreground=T["line"],
+                               font=(FONTS["body"], 8))
+            dot_lbl.pack()
+            for w in (cell, bar, inner, num_lbl, word_lbl, dot_lbl):
+                w.bind("<Button-1>", lambda e, k=i: self._show_step(k))
+            self._rail_steps.append({"cell": cell, "bar": bar, "inner": inner,
+                                     "num": num_lbl, "word": word_lbl, "dot": dot_lbl})
 
-        # Crop / isolate / reset
-        row = ttk.Frame(side, style="Sidebar.TFrame"); row.pack(fill="x", pady=(2, 0))
-        ttk.Button(row, text="⛶ Isolate subject", command=self._isolate).pack(
-            side="left", fill="x", expand=True, padx=(0, 4))
-        ttk.Button(row, text="Reset", width=6, command=self._reset_prep).pack(side="left")
-        ttk.Label(side, text="Toolbar: ⬚ Set detection area · 🖌 Brush · ⦿ Pick. "
-                  "Brush left-drag erases, right-drag adds pixels.",
-                  style="Sub.TLabel", wraplength=250).pack(anchor="w", pady=(4, 0))
+    def _restyle_rail(self):
+        for i, s in enumerate(self._rail_steps):
+            active = (i == self.active_step)
+            cbg = T["panel"] if active else T["bg"]
+            s["cell"].configure(background=cbg)
+            s["inner"].configure(background=cbg)
+            s["bar"].configure(background=T["accent"] if active else T["bg"])
+            s["num"].configure(background=cbg,
+                               foreground=T["accent"] if active else T["muted"])
+            s["word"].configure(background=cbg,
+                                foreground=T["text"] if active else T["muted"])
+            s["dot"].configure(background=cbg)
+        self._update_rail_state()
 
-        # Brush size + color tolerance + color swatch
-        self.brush = self._slider(side, "Brush size (px)", 6.0, 90.0,
-                                  self._p("brush", 26.0), fmt="{:.0f}", live=False)
-        self.coltol = self._slider(side, "Color range", 4.0, 60.0,
-                                   self._p("coltol", 16.0), fmt="{:.0f}", live=False)
-        # Only re-traces while a color is actually being isolated (else it's inert).
-        self.coltol.trace_add("write", lambda *_: self.color_active and self._schedule())
-        crow = ttk.Frame(side, style="Sidebar.TFrame"); crow.pack(fill="x", pady=(6, 0))
-        ttk.Label(crow, text="Picked color", style="Field.TLabel").pack(side="left")
-        self.swatch = tk.Label(crow, text="  none  ", bg=T["elevated"], fg=T["muted"],
-                               font=("Consolas", 8), relief="flat")
-        self.swatch.pack(side="left", padx=(6, 6))
-        ttk.Button(crow, text="Clear", width=6, command=self._clear_color).pack(side="right")
+    def _step_done(self):
+        """Best-effort completion per step, so the rail doubles as progress."""
+        has_img = self.path is not None
+        has_mask = self.mask is not None and bool(self.mask.any())
+        has_geom = bool(self.tally) and sum(self.tally.values()) > 0
+        scaled = bool(self._meas_lines) or bool(getattr(self, "_scale_user", False))
+        clean = has_geom and self.audit_txt.startswith("0 audit")
+        return [has_img, has_img and has_mask, has_geom, has_geom and scaled, clean]
 
-        # Threshold mode + live histogram
-        self._section(side, "THRESHOLD")
-        self.thresh_mode = tk.StringVar(value=self._p("thresh_mode", "Auto (Otsu)"))
-        self.tcb = ttk.Combobox(side, textvariable=self.thresh_mode, state="readonly",
-                                values=["Auto (Otsu)", "Manual", "Adaptive (uneven light)"])
-        self.tcb.pack(fill="x")
-        self.tcb.bind("<<ComboboxSelected>>", lambda e: self._on_thresh_mode())
-        self.threshval = tk.DoubleVar(value=float(self._p("threshval", 128)))
-        self.hist = tk.Canvas(side, height=58, background=T["elevated"],
-                              highlightthickness=1, highlightbackground=T["line"])
-        self.hist.pack(fill="x", pady=(6, 0))
-        self.hist.bind("<Configure>", lambda e: self._draw_histogram())
-        self.hist.bind("<Button-1>", self._hist_drag)
-        self.hist.bind("<B1-Motion>", self._hist_drag)
-        self.thresh_hint = ttk.Label(side, text="drag the line to set a manual threshold",
-                                     style="Sub.TLabel", wraplength=250)
-        self.thresh_hint.pack(anchor="w", pady=(2, 0))
+    def _update_rail_state(self):
+        if not hasattr(self, "_rail_steps"):
+            return
+        done = self._step_done()
+        for i, s in enumerate(self._rail_steps):
+            if done[i]:
+                s["dot"].configure(text="✓", foreground=T["accent"])
+            elif i == self.active_step:
+                s["dot"].configure(text="●", foreground=T["accent_hi"])
+            else:
+                s["dot"].configure(text="○", foreground=T["line"])
 
-    def _build_trace(self, side):
-        self._step(side, "2 · TRACE", "detect & fit clean geometry")
+    def _show_step(self, i):
+        i = max(0, min(len(self.panels) - 1, int(i)))
+        self.active_step = i
+        for f in self.panels.values():
+            f.pack_forget()
+        self.panels[i].pack(fill="x", anchor="n")
+        self._restyle_rail()
+        self._bind_wheel(self.panels[i])
+        self._sc.yview_moveto(0)
+        self._update_scroll()
+        self._save_prefs()
 
-        self.preset = tk.StringVar(value=self._p("preset", "Filled shape"))
-        pcb = ttk.Combobox(side, textvariable=self.preset, state="readonly",
-                           values=list(PRESETS) + ["Custom"])
-        pcb.pack(fill="x", pady=(2, 0))
-        pcb.bind("<<ComboboxSelected>>", lambda e: self.apply_preset())
+    def _on_host_canvas_configure(self, event):
+        self._sc.itemconfigure(self._host_win, width=event.width)
+        self._update_scroll()
 
-        self._section(side, "MODE")
-        self.fit = tk.BooleanVar(value=self._p("fit", True))
-        self.centerline = tk.BooleanVar(value=self._p("centerline", False))
-        self.canny = tk.BooleanVar(value=self._p("canny", False))
-        self.invert = tk.BooleanVar(value=self._p("invert", False))
-        self.show_pts = tk.BooleanVar(value=self._p("show_pts", True))
-        self.show_gaps = tk.BooleanVar(value=self._p("show_gaps", True))
-        self.merge = tk.BooleanVar(value=self._p("merge", True))
-        self._check(side, "Fit lines & arcs", self.fit, mode=True)
-        self._check(side, "Centerline (single path)", self.centerline, mode=True)
-        self._check(side, "Trace outlines (Canny)", self.canny, mode=True)
-        self._check(side, "Invert (light shape)", self.invert, mode=True)
+    def _panel(self, host, title, subtitle, builder):
+        f = ttk.Frame(host, style="Sidebar.TFrame")
+        ttk.Label(f, text=title, style="Step.TLabel").pack(anchor="w", pady=(2, 0))
+        ttk.Label(f, text=subtitle, style="Desc.TLabel", wraplength=248).pack(anchor="w", pady=(0, 2))
+        builder(f)
+        return f
 
-        self._section(side, "TUNING")
-        self.auto_btn = ttk.Button(side, text="✦  Auto-adjust", style="Accent.TButton",
-                                   command=self.auto, state="disabled")
-        self.auto_btn.pack(fill="x", pady=(0, 2))
-        self.simplify = self._slider(side, "Simplify", 0.5, 8.0, self._p("simplify", 2.0))
-        self.dejag = self._slider(side, "De-jag", 0.0, 4.0, self._p("dejag", 1.2))
-        self.weldval = self._slider(side, "Weld gaps", 0.0, 6.0, self._p("weldval", 1.5))
-        self.filletval = self._slider(side, "Fillet corners", 0.0, 25.0, self._p("filletval", 0.0))
-        self.minarea = self._slider(side, "Ignore specks", 0.0, 1000.0,
-                                    self._p("minarea", 40.0), fmt="{:.0f}")
-        self._check(side, "Merge similar entities", self.merge, mode=True)
-
-    def _build_scale_section(self, side):
-        self._step(side, "3 · SCALE / OUTPUT", "set true real-world size")
-        self._build_scale(side)
-
-    def _build_display(self, side):
-        self._section(side, "DISPLAY")
-        self.bg_view = tk.StringVar(value=self._p("bg_view", "Dimmed mask"))
+    # -- persistent footer (View + Legend) -------------------------------- #
+    def _build_footer(self, parent):
+        ttk.Separator(parent).pack(fill="x")
+        inner = ttk.Frame(parent, style="Sidebar.TFrame", padding=(16, 6, 16, 4))
+        inner.pack(fill="x")
+        ttk.Label(inner, text="VIEW", style="Section.TLabel").pack(anchor="w")
+        self.bg_view = tk.StringVar(value=self._p("bg_view", "Original image"))
         self.highlight = tk.BooleanVar(value=self._p("highlight", False))
-        r = ttk.Frame(side, style="Sidebar.TFrame"); r.pack(fill="x", pady=(2, 2))
+        r = ttk.Frame(inner, style="Sidebar.TFrame"); r.pack(fill="x", pady=(2, 2))
         ttk.Label(r, text="Background", style="Field.TLabel").pack(side="left")
         bcb = ttk.Combobox(r, textvariable=self.bg_view, state="readonly", width=13,
                            values=["Dimmed mask", "Original image"])
         bcb.pack(side="right")
         bcb.bind("<<ComboboxSelected>>", lambda e: self._on_view_change())
-        self._check(side, "Highlight detected pixels", self.highlight, view=True)
-        self._check(side, "Show points", self.show_pts, redraw_only=True)
-        self._check(side, "Flag open gaps (red)", self.show_gaps, redraw_only=True)
-        ttk.Checkbutton(side, text="Show guides in viewer", variable=self.show_guides,
+        self._check(inner, "Highlight detected pixels", self.highlight, view=True)
+        self._check(inner, "Show points", self.show_pts, redraw_only=True)
+        self._check(inner, "Flag open gaps (red)", self.show_gaps, redraw_only=True)
+        ttk.Checkbutton(inner, text="Show guides in viewer", variable=self.show_guides,
                         command=lambda: (self._blit(), self._save_prefs())).pack(anchor="w", pady=1)
+        ttk.Label(inner, text="LEGEND", style="Section.TLabel").pack(anchor="w", pady=(8, 1))
+        leg = ttk.Frame(inner, style="Sidebar.TFrame"); leg.pack(fill="x", pady=(0, 2))
+        for kind, bgr in list(COLORS.items()) + [("gap", GAP_BGR)]:
+            cell = ttk.Frame(leg, style="Sidebar.TFrame"); cell.pack(side="left", padx=(0, 7))
+            tk.Label(cell, text="■", fg=_hex(bgr), bg=T["panel"], font=(FONTS["body"], 9)).pack(side="left")
+            ttk.Label(cell, text=kind, style="Sub.TLabel").pack(side="left", padx=(2, 0))
+
+    # -- step panels ------------------------------------------------------ #
+    def _panel_source(self, p):
+        self._sub(p, "LOAD", first=True)
+        row = ttk.Frame(p, style="Sidebar.TFrame"); row.pack(fill="x", pady=(2, 0))
+        ttk.Button(row, text="Open image…", command=self.pick).pack(
+            side="left", fill="x", expand=True, padx=(0, 4))
+        b_paste = ttk.Button(row, text="⎘ Paste", width=8, command=self.paste_clipboard)
+        b_paste.pack(side="left")
+        self._tip(b_paste, "Paste an image straight from the clipboard (Ctrl+V) — a "
+                  "screen snip or a copied picture. Needs Pillow.")
+        b_batch = ttk.Button(p, text="Batch convert folder…", command=self.batch_folder)
+        b_batch.pack(fill="x", pady=(6, 0))
+        self._tip(b_batch, "Convert every image in a folder to the current format using "
+                  "these settings; results land in an 'img2cad_out' subfolder.")
+        self._desc(p, "Convert a whole folder at once with the current settings.")
+
+        self._sub(p, "IMAGE")
+        self.info_lbl = ttk.Label(p, text="No image loaded.", style="Read.TLabel",
+                                  wraplength=248)
+        self.info_lbl.pack(anchor="w")
+
+        self._sub(p, "PROJECT")
+        self._planned_row(p, "Save project (.img2cad)…",
+                          "Save the image reference + all settings + masks so you can "
+                          "reopen, tweak, and re-export later. (idea #19)")
+        self._planned_row(p, "Open project…",
+                          "Reopen a saved .img2cad project. (idea #19)")
+
+    def _panel_prepare(self, p):
+        self._sub(p, "DETECTION AREA", first=True)
+        self._desc(p, "Restrict tracing to one region of the image.")
+        b_area = self._tool_button(p, "crop", "⬚ Set detection area",
+                                   fill="x", pady=(2, 0))
+        self._tip(b_area, "Turn on, then drag a box on the image to trace only inside "
+                  "it. A click without a drag clears it. Press Esc to cancel the tool.")
+        row = ttk.Frame(p, style="Sidebar.TFrame"); row.pack(fill="x", pady=(4, 0))
+        b_iso = ttk.Button(row, text="⛶ Isolate subject", command=self._isolate)
+        b_iso.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self._tip(b_iso, "One-click background removal (OpenCV GrabCut). Draw a "
+                  "detection area first to focus it on the subject.")
+        ttk.Button(row, text="Reset", width=6, command=self._reset_prep).pack(side="left")
+
+        self._sub(p, "MASKING BRUSH")
+        b_brush = self._tool_button(p, "brush", "🖌 Brush", fill="x", pady=(2, 0))
+        self._tip(b_brush, "Turn on, then left-drag to wipe clutter to background and "
+                  "right-drag to add pixels back. Press Esc to cancel the tool.")
+        self.brush = self._slider(p, "Brush size (px)", 6.0, 90.0,
+                                  self._p("brush", 26.0), fmt="{:.0f}", live=False)
+
+        self._sub(p, "COLOUR ISOLATION")
+        b_pick = self._tool_button(p, "pick", "⦿ Pick a colour", fill="x", pady=(2, 0))
+        self._tip(b_pick, "Turn on, then click a colour in the image to trace only "
+                  "regions of that colour. Press Esc to cancel the tool.")
+        self.coltol = self._slider(p, "Colour range", 4.0, 60.0,
+                                   self._p("coltol", 16.0), fmt="{:.0f}", live=False)
+        self.coltol.trace_add("write", lambda *_: self.color_active and self._schedule())
+        crow = ttk.Frame(p, style="Sidebar.TFrame"); crow.pack(fill="x", pady=(6, 0))
+        ttk.Label(crow, text="Picked colour", style="Field.TLabel").pack(side="left")
+        self.swatch = tk.Label(crow, text="  none  ", bg=T["elevated"], fg=T["muted"],
+                               font=(FONTS["mono"], 8), relief="flat")
+        self.swatch.pack(side="left", padx=(6, 6))
+        ttk.Button(crow, text="Clear", width=6, command=self._clear_color).pack(side="right")
+
+        self._sub(p, "THRESHOLD")
+        self._desc(p, "How the photo becomes the black-and-white mask that gets traced.")
+        self.thresh_mode = tk.StringVar(value=self._p("thresh_mode", "Auto (Otsu)"))
+        self.tcb = ttk.Combobox(p, textvariable=self.thresh_mode, state="readonly",
+                                values=["Auto (Otsu)", "Manual", "Adaptive (uneven light)"])
+        self.tcb.pack(fill="x")
+        self.tcb.bind("<<ComboboxSelected>>", lambda e: self._on_thresh_mode())
+        self.threshval = tk.DoubleVar(value=float(self._p("threshval", 128)))
+        self.hist = tk.Canvas(p, height=58, background=T["elevated"],
+                              highlightthickness=1, highlightbackground=T["line"])
+        self.hist.pack(fill="x", pady=(6, 0))
+        self.hist.bind("<Configure>", lambda e: self._draw_histogram())
+        self.hist.bind("<Button-1>", self._hist_drag)
+        self.hist.bind("<B1-Motion>", self._hist_drag)
+        self.thresh_hint = ttk.Label(p, text="drag the line to set a manual threshold",
+                                     style="Desc.TLabel", wraplength=248)
+        self.thresh_hint.pack(anchor="w", pady=(2, 0))
+        # Adaptive params: revealed only when Adaptive mode is chosen.
+        self._adaptive_frame = ttk.Frame(p, style="Sidebar.TFrame")
+        self.adablock = self._slider(self._adaptive_frame, "Adaptive block", 3.0, 99.0,
+                                     self._p("adablock", 35.0), fmt="{:.0f}", flip=False)
+        self.adac = self._slider(self._adaptive_frame, "Adaptive bias (C)", -20.0, 30.0,
+                                 self._p("adac", 7.0), fmt="{:.0f}", flip=False)
+
+        self._sub(p, "POLARITY & NOISE")
+        self._adaptive_after = self._last_sub
+        self.invert = tk.BooleanVar(value=self._p("invert", False))
+        self._check(p, "Invert (trace the light shape)", self.invert, mode=True)
+        self._desc(p, "Turn on when the subject is lighter than its background.")
+        self.blurval = self._slider(p, "Blur / de-noise", 0.0, 9.0,
+                                    self._p("blur", 3.0), fmt="{:.0f}", flip=False)
+
+        self._sub(p, "ASSIST")
+        self.auto_btn = ttk.Button(p, text="✦  Auto-adjust", style="Accent.TButton",
+                                   command=self.auto, state="disabled")
+        self.auto_btn.pack(fill="x", pady=(0, 2))
+        self._desc(p, "Inspect the image and pick sensible settings automatically.")
+        self._planned_row(p, "Auto-detect image type",
+                          "Classify the image (logo / line-art / photo / sketch) and "
+                          "apply the whole matching recipe in one shot. (idea #17)")
+        self._planned_row(p, "Intelligent scissors trace",
+                          "Click along a boundary and snap the path to the strongest "
+                          "edge between clicks. (idea #18)")
+
+    def _panel_trace(self, p):
+        self._sub(p, "RECIPE", first=True)
+        self.preset = tk.StringVar(value=self._p("preset", "Filled shape"))
+        pcb = ttk.Combobox(p, textvariable=self.preset, state="readonly",
+                           values=list(PRESETS) + ["Custom"])
+        pcb.pack(fill="x", pady=(2, 0))
+        pcb.bind("<<ComboboxSelected>>", lambda e: self.apply_preset())
+        self._desc(p, "A starting point tuned to a kind of image; any tweak → “Custom”.")
+
+        self._sub(p, "METHOD")
+        self.fit = tk.BooleanVar(value=self._p("fit", True))
+        self.centerline = tk.BooleanVar(value=self._p("centerline", False))
+        self.canny = tk.BooleanVar(value=self._p("canny", False))
+        self.merge = tk.BooleanVar(value=self._p("merge", True))
+        self.extonly = tk.BooleanVar(value=self._p("extonly", False))
+        self.aspoly = tk.BooleanVar(value=self._p("aspoly", False))
+        c1 = self._check(p, "Fit lines & arcs", self.fit, mode=True)
+        self._tip(c1, "Infer straight lines, circular arcs and circles — the clean, "
+                  "low-count geometry Onshape imports best.")
+        c2 = self._check(p, "Centerline (single path)", self.centerline, mode=True)
+        self._tip(c2, "Trace the medial skeleton of strokes — one line down the middle "
+                  "instead of a double outline. Best for line art.")
+        c3 = self._check(p, "Trace outlines (Canny)", self.canny, mode=True)
+        self._tip(c3, "Follow edges instead of filled regions — for outline-only art.")
+
+        self._sub(p, "DETAIL")
+        self.simplify = self._slider(p, "Simplify", 0.5, 8.0, self._p("simplify", 2.0))
+        self.dejag = self._slider(p, "De-jag", 0.0, 4.0, self._p("dejag", 1.2))
+        self.cornerval = self._slider(p, "Corner sharpness", 8.0, 80.0,
+                                      self._p("corner", 32.0), fmt="{:.0f}")
+        self.weldval = self._slider(p, "Weld gaps", 0.0, 6.0, self._p("weldval", 1.5))
+        self.minarea = self._slider(p, "Ignore specks", 0.0, 1000.0,
+                                    self._p("minarea", 40.0), fmt="{:.0f}")
+        ce = self._check(p, "Ignore interior holes", self.extonly, mode=True)
+        self._tip(ce, "Keep only outer outlines and drop inner holes (e.g. the middle "
+                  "of a washer).")
+
+        self._sub(p, "OPTIMISE")
+        cm = self._check(p, "Merge similar entities", self.merge, mode=True)
+        self._tip(cm, "Fuse collinear lines and co-radial arcs, and collapse a full "
+                  "ring of arcs into one circle — fewer, cleaner entities.")
+        self.filletval = self._slider(p, "Fillet corners", 0.0, 25.0, self._p("filletval", 0.0))
+        self._planned_row(p, "Axis & angle snapping",
+                          "Snap near-horizontal/vertical lines and near-90° corners to "
+                          "exact, for a trivially constrainable sketch. (idea #14)")
+        self._planned_row(p, "Tangent cleanup (G1)",
+                          "Match tangents where a line meets an arc so joints read as "
+                          "smooth, not kinked. (idea #13)")
+        self._planned_row(p, "Smart per-corner fillet",
+                          "Estimate each corner's true radius from local curvature "
+                          "instead of one global value. (idea #15)")
+        self._planned_row(p, "Enforce symmetry",
+                          "Detect mirror symmetry and average the halves so the part is "
+                          "exactly symmetric. (idea #16)")
+
+        self._sub(p, "ADVANCED")
+        ca = self._check(p, "Emit polylines (legacy)", self.aspoly, mode=True)
+        self._tip(ca, "Only used when “Fit lines & arcs” is off: write straight-segment "
+                  "polylines instead of splines.")
+
+    def _panel_scale(self, p):
+        self.units = tk.StringVar(value=self._p("units", "mm"))
+        self.reference = tk.StringVar(value=self._p("reference", "Geometry"))
+        self.lock = tk.BooleanVar(value=self._p("lock", True))
+        self.rot = tk.StringVar(value=self._p("rot", "0"))
+        self.wvar = tk.StringVar(value="—")
+        self.hvar = tk.StringVar(value="—")
+        self.exp_bbox = tk.BooleanVar(value=self._p("exp_bbox", False))
+        self.exp_center = tk.BooleanVar(value=self._p("exp_center", False))
+
+        self._sub(p, "UNITS", first=True)
+        r1 = ttk.Frame(p, style="Sidebar.TFrame"); r1.pack(fill="x", pady=(2, 0))
+        ttk.Label(r1, text="Units", style="Field.TLabel").pack(side="left")
+        ttk.Combobox(r1, textvariable=self.units, values=list(UNIT_MM), width=5,
+                     state="readonly").pack(side="left", padx=(4, 10))
+        ttk.Label(r1, text="Measure from", style="Field.TLabel").pack(side="left")
+        ttk.Combobox(r1, textvariable=self.reference, values=["Geometry", "Image"], width=9,
+                     state="readonly").pack(side="left", padx=(4, 0))
+        self._desc(p, "“Measure from” also frames the exported guides.")
+
+        self._sub(p, "SIZE")
+        wr = ttk.Frame(p, style="Sidebar.TFrame"); wr.pack(fill="x", pady=(2, 0))
+        ttk.Label(wr, text="Width", style="Field.TLabel", width=6).pack(side="left")
+        self.wentry = ttk.Entry(wr, textvariable=self.wvar, width=8); self.wentry.pack(side="left")
+        self.wunit = ttk.Label(wr, text="mm", style="Sub.TLabel"); self.wunit.pack(side="left", padx=(4, 0))
+        hr = ttk.Frame(p, style="Sidebar.TFrame"); hr.pack(fill="x", pady=(4, 0))
+        ttk.Label(hr, text="Height", style="Field.TLabel", width=6).pack(side="left")
+        self.hentry = ttk.Entry(hr, textvariable=self.hvar, width=8); self.hentry.pack(side="left")
+        self.hunit = ttk.Label(hr, text="mm", style="Sub.TLabel"); self.hunit.pack(side="left", padx=(4, 0))
+        ttk.Checkbutton(p, text="Lock aspect ratio", variable=self.lock,
+                        command=self._on_lock).pack(anchor="w", pady=(4, 0))
+
+        self._sub(p, "CALIBRATE · CLICK-TO-SCALE")
+        cal = tk.Frame(p, background=T["panel"], highlightbackground=T["accent"],
+                       highlightthickness=1)
+        cal.pack(fill="x", pady=(2, 0))
+        self.meas_lbl = ttk.Label(cal, text="Set true size by measuring the image: turn "
+                                  "on Measure, click two ends of a known length, then "
+                                  "type its real size.", style="Desc.TLabel", wraplength=224)
+        self.meas_lbl.pack(anchor="w", padx=8, pady=(6, 4))
+        b_meas = self._tool_button(cal, "measure", "📏 Measure two points",
+                                   fill="x", padx=8, pady=(0, 4))
+        self._tip(b_meas, "Measure anywhere on the image — even outside the detection "
+                  "area (the source image is shown so you can see it). One line locks "
+                  "aspect; add a second ⟂ line to unlock it. Press Esc to cancel.")
+        ttk.Button(cal, text="Clear scale lines", command=self._clear_measure).pack(
+            fill="x", padx=8, pady=(0, 8))
+        self.readout = ttk.Label(p, text="", style="Read.TLabel", wraplength=248)
+        self.readout.pack(anchor="w", pady=(6, 2))
+
+        self._sub(p, "ORIENTATION")
+        r2 = ttk.Frame(p, style="Sidebar.TFrame"); r2.pack(fill="x", pady=(2, 0))
+        ttk.Label(r2, text="Rotate°", style="Field.TLabel").pack(side="left")
+        sp = ttk.Spinbox(r2, from_=0, to=359, increment=1, textvariable=self.rot, width=4,
+                         wrap=True, command=self._on_rotate)
+        sp.pack(side="left", padx=(4, 4))
+        sp.bind("<Return>", lambda e: self._on_rotate())
+        sp.bind("<KeyRelease>", lambda e: self._schedule_rotate())
+        ttk.Button(r2, text="⟳ 90°", width=6, command=self._rotate_cw).pack(side="left")
+
+        for w in (self.wentry, self.hentry):
+            w.bind("<Return>", self._on_size_edit)
+            w.bind("<FocusOut>", self._on_size_edit)
+        self.units.trace_add("write", lambda *_: self._on_units())
+        self.reference.trace_add("write", lambda *_: self._on_reference())
+
+    def _panel_export(self, p):
+        self.out_fmt = tk.StringVar(value=self._p("out_fmt", "DXF"))
+        self._sub(p, "FORMAT", first=True)
+        fr = ttk.Frame(p, style="Sidebar.TFrame"); fr.pack(fill="x", pady=(2, 0))
+        ttk.Label(fr, text="Preferred format", style="Field.TLabel").pack(side="left")
+        fcb = ttk.Combobox(fr, textvariable=self.out_fmt, values=["DXF", "SVG", "PDF"],
+                           width=6, state="readonly")
+        fcb.pack(side="right")
+        fcb.bind("<<ComboboxSelected>>", lambda e: self._save_prefs())
+        self._desc(p, "DXF imports natively into an Onshape sketch. The Save dialog's "
+                   "extension still has the final say.")
+
+        self._sub(p, "CONSTRUCTION GEOMETRY")
+        ttk.Checkbutton(p, text="Export bounding box", variable=self.exp_bbox,
+                        command=self._save_prefs).pack(anchor="w", pady=1)
+        ttk.Checkbutton(p, text="Export centrelines", variable=self.exp_center,
+                        command=self._save_prefs).pack(anchor="w", pady=1)
+        self._desc(p, "Extra reference geometry on its own layer, framed on the Scale "
+                   "step's “Measure from” reference.")
+
+        self._sub(p, "VALIDATE")
+        self.export_audit = ttk.Label(p, text="Load an image to check.", style="Read.TLabel",
+                                      wraplength=248)
+        self.export_audit.pack(anchor="w")
+        self._tip(self.export_audit, "Onshape rejects structurally-invalid DXFs and "
+                  "chokes past ~8000 entities. Green = good to import.")
+
+        self._sub(p, "ACTIONS")
+        ttk.Button(p, text="Export…", style="Accent.TButton", command=self.save).pack(
+            fill="x", pady=(2, 2))
+        ttk.Button(p, text="Batch export folder…", command=self.batch_folder).pack(fill="x")
+        self._planned_row(p, "FeatureScript (.fs) export",
+                          "Emit an Onshape custom feature with the geometry baked in as "
+                          "literals — no DXF, no API, no OAuth. (idea #20)")
 
     def _on_close(self):
         self._save_prefs()
@@ -543,14 +913,58 @@ class App:
         elif not overflow and self._vsb_shown:
             self._vsb.pack_forget(); self._vsb_shown = False; self._sc.yview_moveto(0)
 
-    def _section(self, parent, text):
-        ttk.Separator(parent).pack(fill="x", pady=(11, 0))
-        ttk.Label(parent, text=text, style="Section.TLabel").pack(anchor="w", pady=(6, 1))
+    def _sub(self, parent, text, first=False):
+        """A subcategory header inside a step panel (accent caps, thin rule)."""
+        if not first:
+            ttk.Separator(parent).pack(fill="x", pady=(11, 0))
+        lbl = ttk.Label(parent, text=text, style="Section.TLabel")
+        lbl.pack(anchor="w", pady=(3 if first else 6, 1))
+        self._last_sub = lbl
+        return lbl
 
-    def _step(self, parent, text, sub):
-        ttk.Separator(parent).pack(fill="x", pady=(14, 0))
-        ttk.Label(parent, text=text, style="Step.TLabel").pack(anchor="w", pady=(8, 0))
-        ttk.Label(parent, text=sub, style="Sub.TLabel").pack(anchor="w", pady=(0, 2))
+    def _desc(self, parent, text):
+        """A muted one-line description under a control or header."""
+        ttk.Label(parent, text=text, style="Desc.TLabel",
+                  wraplength=248).pack(anchor="w", pady=(0, 1))
+
+    def _tip(self, widget, text):
+        """Attach a hover tooltip and return the widget (for chaining)."""
+        Tooltip(widget, text)
+        return widget
+
+    def _tool_button(self, parent, mode, text, **pack):
+        """A sidebar button that activates a canvas tool mode (crop/brush/pick/
+        measure). Registers in _tool_btns so _set_mode can highlight the active
+        one; clicking the active tool again returns to pan."""
+        b = ttk.Button(parent, text=text, command=lambda m=mode: self._toggle_mode(m))
+        b.pack(**pack)
+        self._tool_btns[mode] = b
+        return b
+
+    def _toggle_mode(self, mode):
+        self._set_mode("pan" if self.mode == mode else mode)
+
+    def _planned_row(self, parent, label, tip):
+        """A disabled control standing in for a not-yet-built feature, tagged
+        'planned' and explained on hover — so the shell shows the whole roadmap."""
+        row = ttk.Frame(parent, style="Sidebar.TFrame"); row.pack(fill="x", pady=(3, 0))
+        cb = ttk.Checkbutton(row, text=label, state="disabled")
+        cb.pack(side="left")
+        chip = tk.Label(row, text="planned", bg=T["panel"], fg=T["accent2"],
+                        font=(FONTS["mono"], 7))
+        chip.pack(side="right")
+        self._tip(cb, tip); self._tip(chip, tip)
+        return cb
+
+    def _reveal_threshold(self):
+        """Progressive disclosure: the adaptive params only appear in Adaptive mode."""
+        if not hasattr(self, "_adaptive_frame"):
+            return
+        self._adaptive_frame.pack_forget()
+        if self.thresh_mode.get().startswith("Adaptive"):
+            self._adaptive_frame.pack(fill="x", before=self._adaptive_after)
+        if hasattr(self, "_sc"):
+            self._update_scroll()
 
     def _check(self, parent, text, var, redraw_only=False, mode=False, view=False):
         if redraw_only:
@@ -561,7 +975,9 @@ class App:
             cmd = self._on_mode_change
         else:
             cmd = self._schedule
-        ttk.Checkbutton(parent, text=text, variable=var, command=cmd).pack(anchor="w", pady=1)
+        cb = ttk.Checkbutton(parent, text=text, variable=var, command=cmd)
+        cb.pack(anchor="w", pady=1)
+        return cb
 
     def _on_mode_change(self):
         """A MODE/TUNING toggle diverges from the preset -> mark Custom, then recompute."""
@@ -577,7 +993,7 @@ class App:
         self._rebuild_display()
         self._blit(); self._save_prefs()
 
-    def _slider(self, parent, text, lo, hi, init, fmt="{:.1f}", live=True):
+    def _slider(self, parent, text, lo, hi, init, fmt="{:.1f}", live=True, flip=True):
         row = ttk.Frame(parent, style="Sidebar.TFrame"); row.pack(fill="x", pady=(7, 0))
         ttk.Label(row, text=text, style="Field.TLabel").pack(side="left")
         val = ttk.Label(row, text=fmt.format(init), style="Value.TLabel"); val.pack(side="right")
@@ -586,7 +1002,9 @@ class App:
         def on(*_):
             val.config(text=fmt.format(var.get()))
             if live:
-                if not self._applying:
+                # A recipe slider diverging from the preset marks it "Custom";
+                # prep/threshold sliders (flip=False) aren't part of a recipe.
+                if flip and not self._applying and hasattr(self, "preset"):
                     self.preset.set("Custom")
                 self._schedule()
 
@@ -598,66 +1016,6 @@ class App:
     def _sync_labels(self):
         for var, lbl, fmt in self._sliders:
             lbl.config(text=fmt.format(var.get()))
-
-    def _build_scale(self, parent):
-        self.units = tk.StringVar(value=self._p("units", "mm"))
-        self.reference = tk.StringVar(value=self._p("reference", "Geometry"))
-        self.lock = tk.BooleanVar(value=self._p("lock", True))
-        self.rot = tk.StringVar(value=self._p("rot", "0"))
-        self.wvar = tk.StringVar(value="—")
-        self.hvar = tk.StringVar(value="—")
-        self.show_guides = tk.BooleanVar(value=self._p("show_guides", True))
-        self.exp_bbox = tk.BooleanVar(value=self._p("exp_bbox", False))
-        self.exp_center = tk.BooleanVar(value=self._p("exp_center", False))
-
-        r1 = ttk.Frame(parent, style="Sidebar.TFrame"); r1.pack(fill="x", pady=(2, 0))
-        ttk.Label(r1, text="Units", style="Field.TLabel").pack(side="left")
-        ttk.Combobox(r1, textvariable=self.units, values=list(UNIT_MM), width=5,
-                     state="readonly").pack(side="left", padx=(4, 10))
-        ttk.Label(r1, text="Measure", style="Field.TLabel").pack(side="left")
-        ttk.Combobox(r1, textvariable=self.reference, values=["Geometry", "Image"], width=9,
-                     state="readonly").pack(side="left", padx=(4, 0))
-
-        r2 = ttk.Frame(parent, style="Sidebar.TFrame"); r2.pack(fill="x", pady=(7, 0))
-        ttk.Label(r2, text="Rotate°", style="Field.TLabel").pack(side="left")
-        sp = ttk.Spinbox(r2, from_=0, to=359, increment=1, textvariable=self.rot, width=4,
-                         wrap=True, command=self._on_rotate)
-        sp.pack(side="left", padx=(4, 4))
-        sp.bind("<Return>", lambda e: self._on_rotate())
-        sp.bind("<KeyRelease>", lambda e: self._schedule_rotate())
-        ttk.Button(r2, text="⟳ 90°", width=6, command=self._rotate_cw).pack(side="left")
-        ttk.Checkbutton(r2, text="Lock aspect", variable=self.lock,
-                        command=self._on_lock).pack(side="right")
-
-        wr = ttk.Frame(parent, style="Sidebar.TFrame"); wr.pack(fill="x", pady=(8, 0))
-        ttk.Label(wr, text="Width", style="Field.TLabel", width=6).pack(side="left")
-        self.wentry = ttk.Entry(wr, textvariable=self.wvar, width=8); self.wentry.pack(side="left")
-        self.wunit = ttk.Label(wr, text="mm", style="Sub.TLabel"); self.wunit.pack(side="left", padx=(4, 0))
-        hr = ttk.Frame(parent, style="Sidebar.TFrame"); hr.pack(fill="x", pady=(4, 0))
-        ttk.Label(hr, text="Height", style="Field.TLabel", width=6).pack(side="left")
-        self.hentry = ttk.Entry(hr, textvariable=self.hvar, width=8); self.hentry.pack(side="left")
-        self.hunit = ttk.Label(hr, text="mm", style="Sub.TLabel"); self.hunit.pack(side="left", padx=(4, 0))
-
-        # Click-to-scale: measure a known length on the image to set true size.
-        self.meas_lbl = ttk.Label(parent, text="📏 Measure tool: click two ends of a "
-                                  "known length.", style="Sub.TLabel", wraplength=250)
-        self.meas_lbl.pack(anchor="w", pady=(7, 0))
-        mrow = ttk.Frame(parent, style="Sidebar.TFrame"); mrow.pack(fill="x", pady=(2, 0))
-        ttk.Button(mrow, text="Clear scale lines", command=self._clear_measure).pack(
-            side="left", fill="x", expand=True)
-
-        self.readout = ttk.Label(parent, text="", style="Read.TLabel"); self.readout.pack(anchor="w", pady=(6, 2))
-
-        ttk.Checkbutton(parent, text="Export bounding box", variable=self.exp_bbox,
-                        command=self._save_prefs).pack(anchor="w", pady=1)
-        ttk.Checkbutton(parent, text="Export centerlines", variable=self.exp_center,
-                        command=self._save_prefs).pack(anchor="w", pady=1)
-
-        for w in (self.wentry, self.hentry):
-            w.bind("<Return>", self._on_size_edit)
-            w.bind("<FocusOut>", self._on_size_edit)
-        self.units.trace_add("write", lambda *_: self._on_units())
-        self.reference.trace_add("write", lambda *_: self._on_reference())
 
     # -- scale logic ------------------------------------------------------ #
     def _ref_px(self):
@@ -698,8 +1056,10 @@ class App:
         else:
             self.tw_mm = max(w_val, 1e-6) * u
             self.th_mm = max(h_val, 1e-6) * u
+        self._scale_user = True
         self._refresh_scale_fields()
         self._rebuild_display(); self._blit()
+        self._update_rail_state()
 
     def _on_units(self):
         self.wunit.config(text=self.units.get()); self.hunit.config(text=self.units.get())
@@ -844,6 +1204,16 @@ class App:
         v = float(self.coltol.get())
         return (int(v), int(min(120, v * 4 + 20)), int(min(120, v * 4 + 20)))
 
+    def _blur_val(self):
+        b = int(round(float(self.blurval.get())))
+        return b if (b == 0 or b % 2 == 1) else b + 1     # OpenCV needs an odd kernel (or 0)
+
+    def _adablock_val(self):
+        b = int(round(float(self.adablock.get())))
+        if b % 2 == 0:
+            b += 1
+        return max(3, b)
+
     def _opts(self):
         centerline = self.centerline.get()
         u = UNIT_MM[self.units.get()]
@@ -858,7 +1228,10 @@ class App:
         return core.Options(
             invert=self.invert.get(),
             canny=self.canny.get() and not centerline,
+            blur=self._blur_val(),
             adaptive=tm.startswith("Adaptive"),
+            adaptive_block=self._adablock_val(),
+            adaptive_c=float(self.adac.get()),
             threshold=int(self.threshval.get()) if tm == "Manual" else -1,
             color=tuple(self.pick_color) if self.color_active else None,
             color_tol=self._color_tol(),
@@ -869,10 +1242,13 @@ class App:
             centerline=centerline,
             tol=float(self.simplify.get()),
             depixel=float(self.dejag.get()),
+            corner_angle=float(self.cornerval.get()),
             weld=float(self.weldval.get()),
             fillet=float(self.filletval.get()),
             merge=self.merge.get(),
             min_area=float(self.minarea.get()),
+            external_only=self.extonly.get(),
+            as_polyline=self.aspoly.get(),
             epsilon=0.0002 + (self.simplify.get() / 8.0) * 0.008,
             smooth=float(self.dejag.get()),
             units=self.units.get(),
@@ -891,16 +1267,22 @@ class App:
         # Fresh image: drop any prep state from the previous one.
         self.crop = None; self.paint_mask = None; self.add_mask = None; self.gc_mask = None
         self.color_active = False; self._region_ver += 1
+        self._scale_user = False
         self._clear_measure(recompute=False)
         try:
             self.color_img = core.load_bgr(path)
             self._color_dim = (self.color_img.astype(np.float32) * 0.6).astype(np.uint8)
         except Exception:
             self.color_img = self._color_dim = None
+        if self.color_img is not None:
+            h, w = self.color_img.shape[:2]
+            self.info_lbl.config(text=f"{os.path.basename(path)}\n{w} × {h} px")
         self._update_color_swatch()
         self._reset_view(redraw=False)
         self.recompute()
         self._sync_threshold_ui()
+        if self.color_img is not None:
+            self._show_step(1)   # imported OK -> jump to Prepare
 
     def _schedule(self):
         if self._pending is not None:
@@ -932,6 +1314,7 @@ class App:
         self._update_audit(opt)
         self._rebuild_display()
         self._refresh_scale_fields()
+        self._update_rail_state()
         self._blit()
 
     def _update_audit(self, opt):
@@ -941,6 +1324,7 @@ class App:
         except Exception:
             self.audit_txt = ""
             self.audit_lbl.config(text="", foreground=T["muted"])
+            self._set_export_audit("", T["muted"])
             return
         n = sum(self.tally.values())
         ng = len(self.gap_pts)
@@ -958,9 +1342,15 @@ class App:
             if gap_is_fault:
                 bits.append(f"{ng} open gap" + ("s" if ng != 1 else ""))
             self.audit_txt = " · ".join(bits) + " ⚠"
-            col = "#f0a850"
+            col = WARN
             badge = f"{n} entities · " + self.audit_txt
         self.audit_lbl.config(text=badge, foreground=col)
+        self._set_export_audit(badge, col)
+
+    def _set_export_audit(self, text, col):
+        """Mirror the pinned audit badge into the Export step's Validate section."""
+        if hasattr(self, "export_audit"):
+            self.export_audit.config(text=text or "Load an image to check.", foreground=col)
 
     def _crop_rect(self):
         """Axis-aligned image-space bounds of the detection-area quad (for GrabCut)."""
@@ -1044,8 +1434,8 @@ class App:
         # dcolor / dmask feed only the "Original image" background and the
         # "Highlight detected pixels" overlay — warp them lazily, so a plain slider
         # drag (both features off, the default) doesn't pay two extra full-image
-        # warpAffine passes. _on_view_change re-runs this when a toggle turns on.
-        want_color = self._color_dim is not None and self.bg_view.get() == "Original image"
+        # warpAffine passes. _on_view_change / _set_mode re-run this when needed.
+        want_color = self._color_dim is not None and self._show_source()
         self.dcolor = (cv2.warpAffine(self._color_dim, M, (nw, nh), flags=cv2.INTER_NEAREST,
                                       borderValue=CANVAS_BGR) if want_color else self.dbase)
         want_mask = self.mask is not None and self.highlight.get()
@@ -1071,12 +1461,19 @@ class App:
         else:
             self.dbbox = None
 
+    def _show_source(self):
+        """Show the un-masked source image when the view asks for it OR any canvas
+        tool is active — so you can see (and click) features outside the detection
+        area / mask while cropping, brushing, picking, or measuring."""
+        return self.bg_view.get() == "Original image" or self.mode != "pan"
+
     def _composed_base(self):
         """Display background per the current view + highlight toggles (cached)."""
-        key = (self.bg_view.get(), self.highlight.get())
+        show = self._show_source()
+        key = (show, self.highlight.get())
         if self._base_cache is not None and self._base_cache[0] == key:
             return self._base_cache[1]
-        base = self.dcolor if self.bg_view.get() == "Original image" else self.dbase
+        base = self.dcolor if show else self.dbase
         img = base.copy()
         if self.highlight.get() and self.dmask is not None:
             m = self.dmask > 0
@@ -1213,22 +1610,60 @@ class App:
             self._blit()
 
     def _reset_view(self, redraw=True):
+        """Fit the whole image/geometry into the canvas (⤢ Fit to full)."""
         self.zoom, self.ox, self.oy = MIN_ZOOM, 0.0, 0.0
         if redraw:
             self._blit()
 
+    def _fit_to_area(self):
+        """Zoom the canvas to the detection area (⬚ Fit to area)."""
+        if getattr(self, "dbase", None) is None:
+            return
+        if self.crop is None:
+            self._flash("No detection area yet — set one in ② Prepare first.")
+            self._reset_view()
+            return
+        disp = np.asarray(self.crop, float) @ self._disp_R.T + self._disp_tv
+        x0, y0 = disp.min(0); x1, y1 = disp.max(0)
+        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
+        dw, dh = max(x1 - x0, 1.0), max(y1 - y0, 1.0)
+        fit = self._fit_scale(cw, ch)
+        eff = min(cw / dw, ch / dh) * 0.92                    # small breathing margin
+        self.zoom = min(max(eff / fit if fit > 0 else 1.0, MIN_ZOOM), MAX_ZOOM)
+        eff = fit * self.zoom
+        self.ox = (x0 + x1) / 2 * eff - cw / 2
+        self.oy = (y0 + y1) / 2 * eff - ch / 2
+        self._blit()
+
     # -- canvas tool modes ------------------------------------------------ #
     def _set_mode(self, mode):
+        """Activate a canvas tool (or 'pan', the default). Tools live on the
+        sidebar now, so the active one is highlighted wherever its button is; the
+        toolbar hint spells out the tool and that Esc cancels it."""
+        prev = getattr(self, "mode", "pan")
         self.mode = mode
         for m, b in self._tool_btns.items():
-            b.configure(style="ToolOn.TButton" if m == mode else "Tool.TButton")
+            try:
+                b.configure(style="Accent.TButton" if m == mode else "TButton")
+            except Exception:
+                pass
         cursor = next((c for _l, m, c, _h in TOOLS if m == mode), "")
-        hint = next((h for _l, m, _c, h in TOOLS if m == mode), "")
         self.canvas.configure(cursor=cursor)
-        self.tool_hint.config(text=hint)
+        if mode == "pan":
+            self.tool_hint.config(text="drag to pan · scroll to zoom · double-click to fit",
+                                  foreground=T["muted"])
+        else:
+            label = next((l for l, m, _c, _h in TOOLS if m == mode), mode)
+            hint = next((h for _l, m, _c, h in TOOLS if m == mode), "")
+            self.tool_hint.config(text=f"{label} — {hint}   ·   Esc to cancel",
+                                  foreground=T["accent"])
         if mode != "measure":
             self._meas = []
         if getattr(self, "dbase", None) is not None:
+            # Crossing the pan/tool boundary flips whether the source image is shown
+            # (so features outside the mask are visible/clickable) — rebuild for it.
+            if (prev == "pan") != (mode == "pan"):
+                self._rebuild_display()
             self._blit()
 
     def _canvas_to_img(self, cx, cy):
@@ -1433,10 +1868,11 @@ class App:
             why = "Canny outline mode" if self.canny.get() else "color isolation"
             self.thresh_hint.config(text=f"⚠ threshold has no effect in {why} — "
                                     "turn it off to use the threshold.",
-                                    foreground="#f0a850")
+                                    foreground=WARN)
         self._draw_histogram()
 
     def _on_thresh_mode(self):
+        self._reveal_threshold()
         self._draw_histogram()
         self._save_prefs()
         self.recompute()
@@ -1449,6 +1885,7 @@ class App:
         self.threshval.set(val)
         if not self.thresh_mode.get().startswith("Manual"):
             self.thresh_mode.set("Manual")
+            self._reveal_threshold()
         self._draw_histogram()
         self._schedule()
 
@@ -1543,10 +1980,16 @@ class App:
         self._finish_measure()
 
     def _finish_measure(self):
+        self._scale_user = True
         self._refresh_scale_fields()
         self._rebuild_display()
         self._blit()
+        self._update_rail_state()
         self._save_prefs()
+        u = self.units.get()
+        if self.tw_mm is not None:
+            self._flash(f"Scale set — output ≈ {self.tw_mm/UNIT_MM[u]:.1f} × "
+                        f"{self.th_mm/UNIT_MM[u]:.1f} {u}")
 
     # -- interaction (pan / zoom) ---------------------------------------- #
     def _on_wheel(self, event):
@@ -1576,17 +2019,21 @@ class App:
     def save(self):
         if not self.path or not self.items:
             return
-        default = os.path.splitext(self.path)[0] + ".dxf"
+        pref = self.out_fmt.get().lower() if hasattr(self, "out_fmt") else "dxf"
+        types = {"dxf": ("DXF — Onshape sketch", "*.dxf"),
+                 "svg": ("SVG — laser / vector", "*.svg"),
+                 "pdf": ("PDF — print / share", "*.pdf")}
+        # Preferred format first, so the dialog defaults to it.
+        order = [pref] + [k for k in ("dxf", "svg", "pdf") if k != pref]
+        default = os.path.splitext(self.path)[0] + "." + pref
         out = filedialog.asksaveasfilename(
-            defaultextension=".dxf",
+            defaultextension="." + pref,
             initialfile=os.path.basename(default),
-            filetypes=[("DXF — Onshape sketch", "*.dxf"),
-                       ("SVG — laser / vector", "*.svg"),
-                       ("PDF — print / share", "*.pdf")])
+            filetypes=[types[k] for k in order])
         if not out:
             return
         opt = self._opts()
-        fmt = out.rsplit(".", 1)[-1].lower() if "." in os.path.basename(out) else "dxf"
+        fmt = out.rsplit(".", 1)[-1].lower() if "." in os.path.basename(out) else pref
         try:
             mask = self._get_mask(opt)
             items = core.build_items(mask, opt)
@@ -1604,6 +2051,40 @@ class App:
                 if fmt == "dxf" else "")
         messagebox.showinfo("Saved",
                             f"Wrote {tally.get('total', 0)} entities ({breakdown}) to:\n{out}{hint}")
+
+    def batch_folder(self):
+        """Convert every image in a folder with the current settings (idea #2 in the
+        GUI). Thin wrapper over the core pipeline — no GUI-only masks are applied."""
+        d = filedialog.askdirectory(title="Choose a folder of images")
+        if not d:
+            return
+        files = [f for f in sorted(os.listdir(d)) if f.lower().endswith(IMG_TYPES)]
+        if not files:
+            messagebox.showinfo("Batch convert", "No images found in that folder.")
+            return
+        fmt = self.out_fmt.get().lower() if hasattr(self, "out_fmt") else "dxf"
+        opt = self._opts()
+        outdir = os.path.join(d, "img2cad_out")
+        try:
+            os.makedirs(outdir, exist_ok=True)
+        except Exception as e:
+            messagebox.showerror("img2cad", f"Could not create output folder:\n{e}")
+            return
+        done = errs = 0
+        for f in files:
+            try:
+                mask = core.load_binary(os.path.join(d, f), opt)
+                items = core.build_items(mask, opt)
+                h, w = mask.shape[:2]
+                out = os.path.join(outdir, os.path.splitext(f)[0] + "." + fmt)
+                core.export_file(items, out, opt, h, w, fmt=fmt)
+                done += 1
+            except Exception:
+                errs += 1
+        msg = f"Converted {done} image(s) to {fmt.upper()} in:\n{outdir}"
+        if errs:
+            msg += f"\n\n{errs} could not be converted with these settings."
+        messagebox.showinfo("Batch convert", msg)
 
 
 def _icon_path():

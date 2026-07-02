@@ -132,15 +132,49 @@ Two files, one shared core:
 - **`img2cad_gui.py`** — Tkinter front end that `import img2cad as core` and reuses
   the same functions (via `build_items`), so GUI and CLI never diverge. Preview is
   drawn with OpenCV, PNG-encoded in memory, shown via `tk.PhotoImage`. Layout is a
-  **canvas tool-mode toolbar** (Pan · Crop · Brush · Pick · Measure · Fit; `TOOLS`
-  drives labels/cursors/hints, `_set_mode` restyles the active button) above a
-  zoom/pan **canvas studio**, beside a **pipeline-ordered sidebar** (Source →
-  **1 Prepare** → **2 Trace** → **3 Scale/Output** → Display → Legend); a pinned
-  bottom holds the live **audit badge** + **Export** button. Frame compositing is
-  factored into **`_render_frame(cw, ch)`** (offscreen-renderable, so a headless
-  harness can dump feature states to PNG); `_blit` just calls it and encodes. Theming: a `clam` ttk.Style configured from the
-  `T` palette dict ("Slate + Teal"); primitive colors live in `COLORS` (BGR, `GAP_BGR`
-  is the red open-endpoint dot) and feed both the drawing and the legend.
+  slim **canvas toolbar** — now just **⤢ Fit to full** (`_reset_view`) and **⬚ Fit to
+  area** (`_fit_to_area`, zoom to the detection-area crop) plus a hint label — above a
+  zoom/pan **canvas studio**, beside a **numbered vertical step rail** sidebar.
+  **Canvas tools live in the sidebar next to their settings**, not on the toolbar:
+  the crop/brush/pick buttons are in ②Prepare and measure is in ④Scale, each built via
+  `_tool_button(parent, mode, …)` which registers in `self._tool_btns` and toggles the
+  mode (`_toggle_mode`; clicking the active tool returns to pan). **Pan is the default
+  mode** (drag/scroll), there is no pan button, and **Esc cancels any tool**
+  (`root.bind("<Escape>", …→_set_mode("pan"))`). `_set_mode` highlights the active
+  sidebar button (`Accent.TButton` vs `TButton`), sets the cursor from `TOOLS`, and
+  writes an accent toolbar hint `"<label> — <hint> · Esc to cancel"`. While any tool is
+  active, `_show_source()` returns true so `_rebuild_display`/`_composed_base` show the
+  **un-masked source image** — you can see and click features outside the detection
+  area / mask (this is why measuring/scaling anywhere works; a scale set also flashes a
+  confirmation). `_set_mode` calls `_rebuild_display` when crossing the pan/tool
+  boundary so the source-image warp is ready.
+  **Step-rail architecture:** the left column is a slim rail (`_build_rail`, cells =
+  big numeral + word + a state dot ○/●/✓ from `_step_done`, `RAIL_STEPS`/`STEP_SUB`)
+  beside a panel host; clicking a step calls `_show_step(i)` which `pack_forget`s the
+  others and packs `self.panels[i]` (built once by `_panel_source/_panel_prepare/
+  _panel_trace/_panel_scale/_panel_export`). Each panel is titled by `_panel()` and
+  organised into `_sub()` subcategory headers with `_desc()` inline descriptions and
+  hover `Tooltip`s; not-yet-built ideas render as disabled `_planned_row()`s. Steps:
+  **①Source** (open/paste/`batch_folder`; project stubs) → **②Prepare** (isolate +
+  threshold, with `_reveal_threshold` progressively disclosing the adaptive
+  block/C sliders only in Adaptive mode; **invert lives here now**) → **③Trace**
+  (Recipe/Method/Detail/Optimise/Advanced) → **④Scale** (units/size/calibrate/orient)
+  → **⑤Export** (format/guides/validate/actions). Cross-cutting **View filters +
+  Legend** live in a persistent footer (`_build_footer`) that shows on every step; the
+  live **audit badge** + **Export** button stay pinned at the very bottom (lifted above
+  the scroll canvas). The active step persists as `active_step` in prefs. Frame
+  compositing is factored into **`_render_frame(cw, ch)`** (offscreen-renderable);
+  `_blit` calls it and encodes. **Theming lives entirely in `theme.py`** (single
+  source of truth — see `docs/THEME.md`): the GUI does `from theme import T,
+  GEOMETRY_BGR as COLORS, …` and hard-codes no hexes. `theme.T` is the dark teal-on-
+  jet-black semantic ramp (derived from the 5-colour brand palette), `theme.GEOMETRY_*`
+  the categorical entity colours (BGR + hex), `theme.STATUS` the functional colours
+  (`WARN` amber, `GAP_BGR` red, crop/hilite/measure/guides), and `theme.FONTS`/`SIZES`
+  the type system — a drafting-style display face (`Bahnschrift SemiBold`, fallback
+  `Segoe UI Semibold`, resolved in `_apply_theme`) for titles, `Segoe UI` for controls,
+  `Consolas` for every numeric readout. New Options fields now surfaced with real
+  controls: `blur`, `corner_angle`, `external_only`, `adaptive_block`, `adaptive_c`,
+  `as_polyline` (wired in `_opts`; `guide_ref` still follows the Scale reference).
   **Tier-1 features:** *Paste* (Ctrl+V / button, `paste_clipboard` via `PIL.ImageGrab`
   to a temp PNG — Pillow is an optional runtime dep, guarded); *Presets* (`PRESETS`
   recipes set MODE+TUNING; any manual mode/slider change flips the combobox to "Custom"

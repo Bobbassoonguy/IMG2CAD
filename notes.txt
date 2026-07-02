@@ -1,5 +1,13 @@
+NEXT:
+
+3. Use the test images and screenshotting to really assess how the outline capturing is doing and how it could do better, especially with "auto" adjusters
+
+
 
 
 execute @docs\FEATURE_IDEAS.md tier 1. Reorganize the UI to make it intuitive as you add extra features. Make sure the UI is easy to understand and use. Test using the @Alex and Hannah Wedding Seal_ Simplified Wax Seal_2.png and the screenshotting tool and zooming in to check splines and features.
 
   Ultrathink
+
+
+  - lets talk about @FEATURE_IDEAS number 21. So given that one line for scale solves a fixed-aspect-ratio scale, and two lines for scale solves for the actual aspect ratio, what would three lines for scale give me? Could I correct for perspective? (i.e. if my photo was not taken normal to the object)
