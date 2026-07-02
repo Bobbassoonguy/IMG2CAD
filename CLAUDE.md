@@ -39,11 +39,20 @@ Two files, one shared core:
 
 - **`img2cad.py`** — the entire pipeline and CLI, all parameterized by one
   `Options` dataclass. Stages:
-  1. `load_binary()` — decode, composite alpha over white, grayscale, blur, then
-     **binarize**. Otsu by default (auto threshold) or `--canny` for outline
-     tracing. Note the inversion convention: the *shape* must end up white (255);
-     for the common dark-shape-on-light-background case Otsu makes the background
-     white, so it inverts unless `--invert`/`opt.invert` says the foreground is light.
+  1. `load_binary()` — decode (via shared **`load_bgr()`**, alpha over white),
+     grayscale, blur, then **binarize**. Otsu by default, `--adaptive`
+     (`cv2.adaptiveThreshold`, for uneven light/scans), fixed `--threshold`, or
+     `--canny` for outline tracing. Note the inversion convention: the *shape*
+     must end up white (255); for the common dark-shape-on-light-background case
+     Otsu/adaptive make the background white, so it inverts unless
+     `--invert`/`opt.invert` says the foreground is light. Three image-prep hooks
+     compose in here: **`opt.color`** (a picked BGR → HSV-range `color_mask()`,
+     its own mode, hue compared on the circle), **`opt.crop`** (`apply_crop()`
+     zeros outside an `(x0,y0,x1,y1)` ROI, keeping full dimensions so coords don't
+     shift), and an optional **`region`** keep-mask arg (`apply_region()`,
+     GUI-only: the masking brush ∪ **`grabcut_foreground()`**; the CLI leaves it
+     None). `grabcut_foreground()` runs OpenCV GrabCut on a downscaled copy
+     (coarse result, ~2–3 s on big photos) and upsamples the mask.
   2. `find_contours()` — `cv2.findContours` with **`CHAIN_APPROX_NONE`** (dense
      per-pixel boundary; the fitter needs it — a 4-point rectangle from
      `CHAIN_APPROX_SIMPLE` spuriously fits a circumscribed circle). `RETR_CCOMP`
@@ -62,6 +71,11 @@ Two files, one shared core:
 
      **`build_items(mask, opt)` is the single dispatch entry** used by both CLI and
      GUI: centerline → `vectorize_centerline`, else fit → `vectorize_all`, else legacy.
+     After fitting it runs (when `opt.merge`, default on) an **entity-reduction
+     pass** `merge_chain()` per chain — `_merge_lines` fuses collinear lines,
+     `_merge_arcs` fuses co-radial adjacent arcs (and emits a real **CIRCLE** when a
+     merge closes the loop), `_arcs_form_circle` collapses a full ring of arcs —
+     then fillet. Fewer, cleaner entities; disable with `--no-merge`.
   3b. **Centerline mode (`opt.centerline`).** `skeleton_paths()` runs
      `skimage.morphology.skeletonize` on the mask, then walks the 1px skeleton as a
      pixel graph (nodes = endpoints/junctions with ≠2 neighbors; edges traced through
@@ -118,9 +132,13 @@ Two files, one shared core:
 - **`img2cad_gui.py`** — Tkinter front end that `import img2cad as core` and reuses
   the same functions (via `build_items`), so GUI and CLI never diverge. Preview is
   drawn with OpenCV, PNG-encoded in memory, shown via `tk.PhotoImage`. Layout is a
-  themed **sidebar** (Source → Preset → Mode → Tuning → Scale/Output → Display →
-  Legend) + a zoom/pan **canvas studio** + status bar; a pinned bottom holds the live
-  **audit badge** + **Export** button. Theming: a `clam` ttk.Style configured from the
+  **canvas tool-mode toolbar** (Pan · Crop · Brush · Pick · Measure · Fit; `TOOLS`
+  drives labels/cursors/hints, `_set_mode` restyles the active button) above a
+  zoom/pan **canvas studio**, beside a **pipeline-ordered sidebar** (Source →
+  **1 Prepare** → **2 Trace** → **3 Scale/Output** → Display → Legend); a pinned
+  bottom holds the live **audit badge** + **Export** button. Frame compositing is
+  factored into **`_render_frame(cw, ch)`** (offscreen-renderable, so a headless
+  harness can dump feature states to PNG); `_blit` just calls it and encodes. Theming: a `clam` ttk.Style configured from the
   `T` palette dict ("Slate + Teal"); primitive colors live in `COLORS` (BGR, `GAP_BGR`
   is the red open-endpoint dot) and feed both the drawing and the legend.
   **Tier-1 features:** *Paste* (Ctrl+V / button, `paste_clipboard` via `PIL.ImageGrab`
@@ -132,6 +150,31 @@ Two files, one shared core:
   shows `N entities · 0 audit errors ✓` or a `⚠` with error/gap counts); *gap
   highlighter* (`core.open_endpoints` → red dots, toggled by "Flag open gaps");
   *Export* (`core.export_file` picks DXF/SVG/PDF by the save-dialog extension).
+  **Tier-2 features:** the canvas tools dispatch through `_on_press/_on_move/_on_release`
+  by `self.mode`, mapping canvas↔image via the stored display transform
+  (`_canvas_to_img` inverts `_disp_R`/`_disp_tv`; `_img_to_canvas` for overlays):
+  *Set detection area* (mode key `"crop"`; drag a box → `opt.crop`, tiny drag clears it) — a detection-only limit that never distorts the preview); *Brush* (**left**-drag
+  paints `self.paint_mask`, an erase-region via `_region()`; **right**-drag paints
+  `self.add_mask`, force-foreground pixels unioned in by `load_binary`'s `add` arg); *Pick* (eyedropper
+  → `self.pick_color`/`color_active`, HSV `Color range` slider); *Isolate subject*
+  (one-shot `core.grabcut_foreground` → `self.gc_mask`); *Measure* / click-to-scale
+  (click two ends → a themed `LengthDialog` — number entry + a unit dropdown over
+  `MEASURE_UNITS`, input unit independent of the output unit — giving a real length → `core.solve_scale_1line` uniform / a 2nd
+  ⟂ line → `solve_scale_2line` unlocks aspect, both feeding `tw_mm`/`th_mm`). Prep
+  masks (detection area / brush± / GrabCut) fold into the mask-cache key via a
+  `_region_ver` counter so slider drags still skip re-decode. Right-drag pans in
+  every other mode; **`_scale_ratio` returns 1.0 whenever aspect is locked**, so the
+  preview only stretches from an explicit unlock (a 2-line measure) — changing the
+  detection area (which shifts the geometry bounds) can never distort the display. The **Threshold** panel (Auto/Manual/
+  Adaptive combo + a live `cv2.calcHist` **histogram** you drag to set a manual
+  cutoff) steers binarization — but it **disables itself with a reason**
+  (`_threshold_active`/`_sync_threshold_ui`) whenever Canny or color isolation is
+  active, since `load_binary` bypasses the threshold path in those modes (a common
+  "why does the threshold do nothing?" trap). **Display** adds a **background view** (dimmed mask ↔
+  original image — both warped by the same display transform in `_rebuild_display`,
+  composited in `_composed_base` and cached) and a **highlight-detected-pixels**
+  overlay (washes the warped binary mask in teal so you see exactly what feeds the
+  fitter). *Merge similar entities* toggles `opt.merge`.
   **Window sizing:** `main()` clamps height to the screen (`sh-80`) so the pinned
   Export button is always reachable and the sidebar scrolls above it.
   **Scroll-canvas gotcha:** the sidebar is a frame embedded in a `tk.Canvas`; when it's

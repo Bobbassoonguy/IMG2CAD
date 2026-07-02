@@ -34,6 +34,12 @@ class Options:
     threshold: int = -1           # fixed 0-255 threshold; -1 => Otsu (auto)
     canny: bool = False           # use Canny edges instead of filled-region contours
     blur: int = 3                 # gaussian blur kernel (odd, 0=off) to de-noise before edges
+    adaptive: bool = False        # local (adaptive) threshold instead of global Otsu/fixed
+    adaptive_block: int = 35      # neighborhood size for adaptive threshold (odd, >=3)
+    adaptive_c: float = 7.0       # constant subtracted from the local mean (adaptive)
+    color: tuple | None = None    # (B,G,R) target color to isolate (HSV range); None=off
+    color_tol: tuple = (12, 70, 70)   # (H,S,V) half-window for the color match
+    crop: tuple | None = None     # (x0,y0,x1,y1) image-space ROI; None => whole image
 
     # Contour selection
     min_area: float = 25.0        # drop contours smaller than this (px^2) as noise
@@ -47,6 +53,7 @@ class Options:
     weld: float = 1.5             # snap endpoints within this many px so shapes close (0=off)
     centerline: bool = False      # trace stroke skeletons (single path) instead of outlines
     fillet: float = 0.0           # round sharp line-line corners with this radius (px, 0=off)
+    merge: bool = True            # merge collinear lines / co-radial arcs / arc-ring -> circle
 
     # Legacy simplify path (used only when fit=False)
     epsilon: float = 0.0015       # Douglas-Peucker tolerance as a fraction of the contour perimeter
@@ -73,47 +80,146 @@ class Options:
 # --------------------------------------------------------------------------- #
 # Image -> contours
 # --------------------------------------------------------------------------- #
-def load_binary(path: str, opt: Options) -> np.ndarray:
-    """Load image as a clean binary mask (foreground = 255)."""
+def _composite_bgr(img: np.ndarray) -> np.ndarray:
+    """Normalize any decoded image to a 3-channel BGR uint8 (alpha over white)."""
+    if img.ndim == 2:
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    if img.shape[2] == 4:
+        alpha = img[:, :, 3:4].astype(np.float32) / 255.0
+        rgb = img[:, :, :3].astype(np.float32)
+        return (rgb * alpha + 255.0 * (1.0 - alpha)).astype(np.uint8)
+    return img[:, :, :3]
+
+
+def load_bgr(path: str) -> np.ndarray:
+    """Decode `path` to a composited BGR uint8 image (shared by every stage)."""
     img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
     if img is None:
         raise SystemExit(f"error: could not read image '{path}'")
+    return _composite_bgr(img)
 
-    # Composite transparency onto white so alpha-cut PNGs work as expected.
-    if img.ndim == 3 and img.shape[2] == 4:
-        alpha = img[:, :, 3:4].astype(np.float32) / 255.0
-        rgb = img[:, :, :3].astype(np.float32)
-        img = (rgb * alpha + 255.0 * (1.0 - alpha)).astype(np.uint8)
 
-    if img.ndim == 3:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+def color_mask(bgr: np.ndarray, color_bgr, tol) -> np.ndarray:
+    """Foreground=255 where the pixel is within `tol` (H,S,V) of `color_bgr`.
+
+    Hue is compared on the circle so reds near the 0/180 wrap still match.
+    """
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    target = cv2.cvtColor(np.uint8([[list(color_bgr)]]), cv2.COLOR_BGR2HSV)[0, 0].astype(int)
+    th, ts, tv = tol
+    dh = np.abs(hsv[:, :, 0].astype(int) - target[0])
+    dh = np.minimum(dh, 180 - dh)                       # hue is circular (0..179)
+    m = (dh <= th) & (np.abs(hsv[:, :, 1].astype(int) - target[1]) <= ts) \
+        & (np.abs(hsv[:, :, 2].astype(int) - target[2]) <= tv)
+    return (m.astype(np.uint8)) * 255
+
+
+def apply_crop(mask: np.ndarray, crop) -> np.ndarray:
+    """Zero everything outside the (x0,y0,x1,y1) ROI (keeps full dimensions)."""
+    if not crop:
+        return mask
+    h, w = mask.shape[:2]
+    x0, y0, x1, y1 = crop
+    x0, x1 = sorted((int(round(x0)), int(round(x1))))
+    y0, y1 = sorted((int(round(y0)), int(round(y1))))
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(w, x1), min(h, y1)
+    out = np.zeros_like(mask)
+    if x1 > x0 and y1 > y0:
+        out[y0:y1, x0:x1] = mask[y0:y1, x0:x1]
+    return out
+
+
+def apply_region(mask: np.ndarray, region) -> np.ndarray:
+    """Intersect a binary mask with an optional keep-region (brush / GrabCut)."""
+    if region is None:
+        return mask
+    return cv2.bitwise_and(mask, region if region.dtype == np.uint8
+                           else (region.astype(np.uint8) * 255))
+
+
+def grabcut_foreground(path: str, rect, iters: int = 5, max_dim: int = 700) -> np.ndarray:
+    """Auto-cut the subject inside `rect` from its background (OpenCV GrabCut).
+
+    Returns a uint8 mask (255=foreground) at full image resolution. `rect` is
+    (x0,y0,x1,y1) in image px; a generous inset of the whole image if None. The
+    cut runs on a downscaled copy (GrabCut's result is coarse) then is upsampled,
+    keeping the interactive button responsive on large photos.
+    """
+    bgr = load_bgr(path)
+    h, w = bgr.shape[:2]
+    if rect:
+        x0, y0, x1, y1 = rect
+        x0, x1 = sorted((int(x0), int(x1)))
+        y0, y1 = sorted((int(y0), int(y1)))
     else:
-        gray = img
+        x0, y0, x1, y1 = int(w * 0.05), int(h * 0.05), int(w * 0.95), int(h * 0.95)
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(w, x1), min(h, y1)
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return np.full((h, w), 255, np.uint8)
+
+    s = min(1.0, max_dim / float(max(h, w)))
+    if s < 1.0:
+        small = cv2.resize(bgr, (max(1, int(w * s)), max(1, int(h * s))), interpolation=cv2.INTER_AREA)
+        r = (int(x0 * s), int(y0 * s), max(1, int((x1 - x0) * s)), max(1, int((y1 - y0) * s)))
+    else:
+        small, r = bgr, (x0, y0, x1 - x0, y1 - y0)
+    gc = np.zeros(small.shape[:2], np.uint8)
+    bgd, fgd = np.zeros((1, 65), np.float64), np.zeros((1, 65), np.float64)
+    cv2.grabCut(small, gc, r, bgd, fgd, iters, cv2.GC_INIT_WITH_RECT)
+    fg = np.where((gc == cv2.GC_FGD) | (gc == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+    if fg.shape[:2] != (h, w):
+        fg = cv2.resize(fg, (w, h), interpolation=cv2.INTER_NEAREST)
+    return fg
+
+
+def load_binary(path: str, opt: Options, region=None, add=None) -> np.ndarray:
+    """Load image as a clean binary mask (foreground = 255).
+
+    `region` (optional) is an image-resolution keep-mask (from a masking brush or
+    GrabCut) intersected with the result; `add` (optional) is a mask of pixels to
+    force *into* the foreground (a positive brush) unioned in afterwards. Both are
+    GUI-only; the CLI leaves them None.
+    """
+    bgr = load_bgr(path)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
     if opt.blur and opt.blur >= 3:
         k = opt.blur if opt.blur % 2 == 1 else opt.blur + 1
         gray = cv2.GaussianBlur(gray, (k, k), 0)
 
-    if opt.canny:
+    if opt.color is not None:
+        # Color isolation is its own mode: trace only pixels near the picked color.
+        binimg = color_mask(bgr, opt.color, opt.color_tol)
+    elif opt.canny:
         # Auto Canny thresholds from the median (Otsu-like heuristic).
         med = float(np.median(gray))
         lo = int(max(0, 0.66 * med))
         hi = int(min(255, 1.33 * med))
-        edges = cv2.Canny(gray, lo, hi)
+        binimg = cv2.Canny(gray, lo, hi)
         # Close 1px gaps so contours connect.
-        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
-        return edges
-
-    if opt.threshold >= 0:
-        _, binimg = cv2.threshold(gray, opt.threshold, 255, cv2.THRESH_BINARY)
+        binimg = cv2.morphologyEx(binimg, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
     else:
-        _, binimg = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        if opt.adaptive:
+            blk = max(3, int(opt.adaptive_block) | 1)    # force odd, >=3
+            binimg = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                           cv2.THRESH_BINARY, blk, float(opt.adaptive_c))
+        elif opt.threshold >= 0:
+            _, binimg = cv2.threshold(gray, opt.threshold, 255, cv2.THRESH_BINARY)
+        else:
+            _, binimg = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # By convention we want the *shape* to be white (255). Otsu/adaptive make the
+        # brighter region white; for dark-shape-on-light-bg that's the background,
+        # so invert unless the user says otherwise.
+        if not opt.invert:
+            binimg = cv2.bitwise_not(binimg)
 
-    # By convention we want the *shape* to be white (255). Otsu makes the
-    # brighter region white; for dark-shape-on-light-bg that's the background,
-    # so invert unless the user says otherwise.
-    if not opt.invert:
-        binimg = cv2.bitwise_not(binimg)
+    binimg = apply_region(binimg, region)
+    if add is not None:
+        binimg = cv2.bitwise_or(binimg, add if add.dtype == np.uint8
+                                else (add.astype(np.uint8) * 255))
+    binimg = apply_crop(binimg, opt.crop)
     return binimg
 
 
@@ -491,8 +597,14 @@ def build_items(mask: np.ndarray, opt: Options) -> list[list[dict]]:
         items = vectorize_all(find_contours(mask, opt), opt)
     else:
         return [simplify_contour(c, opt) for c in find_contours(mask, opt)]
+    # Fillet BEFORE merge: merging collinear lines can erase a shallow corner, and
+    # the fillet pass would then find no line-line corner to round there. Filleting
+    # first inserts the arc; merge afterwards still fuses genuinely straight runs
+    # (the trimmed line now abuts an arc, not another collinear line).
     if opt.fillet > 0:
         items = [fillet_path(prims, opt.fillet) for prims in items]
+    if opt.merge:
+        items = [merge_chain(prims, opt.tol) for prims in items]
     return items
 
 
@@ -572,6 +684,150 @@ def _chain_is_closed(prims: list[dict], tol: float = 1e-6) -> bool:
     return bool(np.hypot(*(a[0] - b[-1])) <= tol)
 
 
+# --------------------------------------------------------------------------- #
+# Entity reduction: merge collinear lines, fuse co-radial arcs, collapse a full
+# ring of arcs into a single CIRCLE. Fewer, cleaner entities = a tidier Onshape
+# sketch (and safe distance from the ~8000-entity import ceiling). Runs per chain
+# after fitting/welding, so shared junctions stay exact.
+# --------------------------------------------------------------------------- #
+def _merge_lines(a: dict, b: dict, tol: float):
+    """Merge two consecutive lines into one if collinear within `tol`; else None."""
+    a0, a1 = np.asarray(a["pts"][0], float), np.asarray(a["pts"][-1], float)
+    b1 = np.asarray(b["pts"][-1], float)
+    da = a1 - a0
+    la = np.hypot(*da)
+    db = b1 - np.asarray(b["pts"][0], float)
+    lb = np.hypot(*db)
+    if la < 1e-6 or lb < 1e-6:
+        return None
+    ua = da / la
+    # b's far endpoint must sit on a's infinite line, and b must run the same way
+    # (not double back) — otherwise this is a real corner, not a split straight.
+    perp = abs(ua[0] * (b1 - a0)[1] - ua[1] * (b1 - a0)[0])
+    if perp <= tol and float(ua @ (db / lb)) > 0.9962:   # within ~5 deg
+        return {"kind": "line", "pts": np.array([a0, b1])}
+    return None
+
+
+def _merge_arcs(a: dict, b: dict, tol: float, closed: bool):
+    """Merge two consecutive arcs into one if they share a circle; else None.
+
+    Only when the *chain* is closed and the merge would close the loop (the outer
+    endpoints coincide) is a real CIRCLE emitted — in an open chain two arcs whose
+    ends happen to meet (a self-touching path) must stay a connected arc, never a
+    standalone circle that orphans the rest of the chain.
+    """
+    fa = _circle_from_3(a["p0"], a["pm"], a["p1"])
+    fb = _circle_from_3(b["p0"], b["pm"], b["p1"])
+    if fa is None or fb is None:
+        return None
+    (ca, ra), (cb, rb) = fa, fb
+    lim = max(tol, 0.03 * ra)
+    if np.hypot(*(ca - cb)) > lim or abs(ra - rb) > lim:
+        return None
+    p0, pm, p1 = np.asarray(a["p0"]).copy(), np.asarray(a["p1"]).copy(), np.asarray(b["p1"]).copy()
+    # In a closed chain, two co-radial arcs whose outer ends coincide span the whole
+    # loop -> a full circle (the join `pm` is somewhere on it), regardless of how
+    # asymmetric the split was.
+    if closed and np.hypot(*(p0 - p1)) <= lim:
+        return {"kind": "circle", "center": 0.5 * (ca + cb), "r": 0.5 * (ra + rb)}
+    # The shared join (a.p1 ~ b.p0) is interior to the combined sweep, so it's a
+    # valid midpoint that keeps _arc_angles picking the right direction.
+    return {"kind": "arc", "p0": p0, "pm": pm, "p1": p1}
+
+
+def _merge_pair(a: dict, b: dict, tol: float, closed: bool):
+    if a["kind"] == "line" and b["kind"] == "line":
+        return _merge_lines(a, b, tol)
+    if a["kind"] == "arc" and b["kind"] == "arc":
+        return _merge_arcs(a, b, tol, closed)
+    return None
+
+
+def _arcs_form_circle(prims: list[dict], tol: float):
+    """If every arc shares one circle and they sweep ~360 deg, return a CIRCLE dict."""
+    centers, radii, sweep = [], [], 0.0
+    for p in prims:
+        fit = _circle_from_3(p["p0"], p["pm"], p["p1"])
+        if fit is None:
+            return None
+        c, r = fit
+        centers.append(c); radii.append(r)
+        th, _, _ = _arc_angles(c, p["p0"], p["pm"], p["p1"])
+        sweep += abs(th[-1] - th[0])
+    c0, r0 = centers[0], radii[0]
+    lim = max(tol, 0.03 * r0)
+    if all(np.hypot(*(c - c0)) <= lim and abs(r - r0) <= lim
+           for c, r in zip(centers, radii)) and sweep >= 1.9 * np.pi:
+        return {"kind": "circle", "center": np.mean(centers, axis=0),
+                "r": float(np.mean(radii))}
+    return None
+
+
+def merge_chain(prims: list[dict], tol: float) -> list[dict]:
+    """Reduce one primitive chain: merge collinear lines / co-radial arcs; ring->circle."""
+    if len(prims) < 2:
+        return prims
+    closed = _chain_is_closed(prims)
+    prims = list(prims)
+    changed = True
+    while changed and len(prims) > 1:
+        changed = False
+        i = 0
+        while i < len(prims) - 1:
+            m = _merge_pair(prims[i], prims[i + 1], tol, closed)
+            if m is not None:
+                prims[i] = m
+                del prims[i + 1]
+                changed = True
+            else:
+                i += 1
+        if closed and len(prims) >= 2:                  # try the wrap-around seam
+            m = _merge_pair(prims[-1], prims[0], tol, closed)
+            if m is not None:
+                prims[0] = m
+                del prims[-1]
+                changed = True
+    if closed and len(prims) >= 2 and all(p["kind"] == "arc" for p in prims):
+        circ = _arcs_form_circle(prims, tol)
+        if circ is not None:
+            return [circ]
+    return prims
+
+
+# --------------------------------------------------------------------------- #
+# Click-to-scale solvers: turn measured pixel spans of known real length into
+# output units-per-pixel. Pure functions so the GUI's measure tool (and tests)
+# can share them.
+# --------------------------------------------------------------------------- #
+def solve_scale_1line(dxy, length: float):
+    """Uniform units-per-pixel so a segment of pixel-vector `dxy` measures `length`."""
+    d = float(np.hypot(*np.asarray(dxy, float)))
+    if d < 1e-9 or length <= 0:
+        return None
+    return length / d
+
+
+def solve_scale_2line(d1, l1: float, d2, l2: float):
+    """Per-axis (sx, sy) units-per-pixel from two measured spans, or None.
+
+    Solves l_i^2 = sx^2*dx_i^2 + sy^2*dy_i^2 for the two known lengths — so even
+    slightly angled calibration lines correct a skewed/keystoned photo. Falls back
+    to None (caller uses the 1-line result) if the system is degenerate.
+    """
+    d1 = np.asarray(d1, float); d2 = np.asarray(d2, float)
+    A = np.array([[d1[0] ** 2, d1[1] ** 2], [d2[0] ** 2, d2[1] ** 2]], float)
+    if abs(np.linalg.det(A)) < 1e-9 or l1 <= 0 or l2 <= 0:
+        return None
+    try:
+        a, b = np.linalg.solve(A, np.array([l1 ** 2, l2 ** 2], float))
+    except np.linalg.LinAlgError:
+        return None
+    if a <= 0 or b <= 0:
+        return None
+    return float(np.sqrt(a)), float(np.sqrt(b))
+
+
 def open_endpoints(items: list, tol: float) -> np.ndarray:
     """Endpoints that don't meet another primitive's endpoint within `tol` px.
 
@@ -632,13 +888,7 @@ def geometry_bounds(items: list, is_primitive: bool) -> tuple | None:
 # Auto-adjust: inspect the image and pick sensible settings automatically.
 # --------------------------------------------------------------------------- #
 def _read_gray(path: str) -> np.ndarray:
-    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-    if img is None:
-        raise SystemExit(f"error: could not read image '{path}'")
-    if img.ndim == 3 and img.shape[2] == 4:            # composite alpha over white
-        a = img[:, :, 3:4].astype(np.float32) / 255.0
-        img = (img[:, :, :3].astype(np.float32) * a + 255.0 * (1.0 - a)).astype(np.uint8)
-    return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    return cv2.cvtColor(load_bgr(path), cv2.COLOR_BGR2GRAY)
 
 
 def auto_adjust(path: str) -> dict:
@@ -1092,6 +1342,18 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--canny", action="store_true", help="trace outline edges instead of filled shapes")
     g.add_argument("--invert", action="store_true", help="foreground is the LIGHT region, not the dark one")
     g.add_argument("--threshold", type=int, default=-1, help="fixed 0-255 threshold (default: auto/Otsu)")
+    g.add_argument("--adaptive", action="store_true",
+                   help="use local (adaptive) thresholding for uneven light / scans")
+    g.add_argument("--adaptive-block", type=int, default=35,
+                   help="adaptive neighborhood size (odd, >=3)")
+    g.add_argument("--adaptive-c", type=float, default=7.0,
+                   help="adaptive: constant subtracted from the local mean")
+    g.add_argument("--color", default=None,
+                   help="isolate a color (e.g. '#c0392b' or 'b,g,r') and trace only it")
+    g.add_argument("--color-tol", default=None,
+                   help="H,S,V half-window for --color match (default 12,70,70)")
+    g.add_argument("--crop", default=None,
+                   help="restrict tracing to a region: 'x0,y0,x1,y1' in pixels")
     g.add_argument("--blur", type=int, default=3, help="gaussian blur kernel to de-noise (odd, 0=off)")
     g.add_argument("--min-area", type=float, default=25.0, help="drop specks smaller than this (px^2)")
     g.add_argument("--external-only", action="store_true", help="ignore interior holes")
@@ -1111,6 +1373,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="trace stroke skeletons (single path) instead of outlines")
     s.add_argument("--fillet", type=float, default=0.0,
                    help="round sharp line-line corners with this radius (px, 0=off)")
+    s.add_argument("--no-merge", action="store_true",
+                   help="disable the entity-reduction pass (keep every fitted primitive)")
     s.add_argument("--polyline", action="store_true",
                    help="(with --no-fit) emit polylines instead of splines")
     s.add_argument("--epsilon", type=float, default=0.0015,
@@ -1131,12 +1395,66 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _parse_color(s: str | None):
+    """Parse '#rgb', '#rrggbb', or 'b,g,r' into a (B,G,R) tuple, or None."""
+    if not s:
+        return None
+    s = s.strip()
+    bad = f"error: could not parse --color {s!r} (use '#rgb', '#rrggbb', or 'b,g,r')"
+    if s.startswith("#"):
+        hexs = s[1:]
+        if len(hexs) == 3:                              # '#rgb' shorthand -> '#rrggbb'
+            hexs = "".join(c * 2 for c in hexs)
+        if len(hexs) != 6:
+            raise SystemExit(bad)
+        try:
+            r, g, b = (int(hexs[i:i + 2], 16) for i in (0, 2, 4))
+        except ValueError:
+            raise SystemExit(bad)
+        return (b, g, r)
+    try:
+        parts = [int(x) for x in s.replace(" ", "").split(",")]
+    except ValueError:
+        raise SystemExit(bad)
+    if len(parts) == 3:
+        return tuple(parts)                             # already B,G,R
+    raise SystemExit(bad)
+
+
+def _parse_color_tol(s: str | None):
+    """Parse 'h,s,v' into an (H,S,V) half-window tuple; default (12,70,70)."""
+    if not s:
+        return (12, 70, 70)
+    try:
+        parts = [int(x) for x in s.replace(" ", "").split(",")]
+    except ValueError:
+        parts = []
+    if len(parts) != 3:
+        raise SystemExit(f"error: --color-tol wants 'h,s,v', got {s!r}")
+    return tuple(parts)
+
+
+def _parse_crop(s: str | None):
+    if not s:
+        return None
+    parts = [float(x) for x in s.replace(" ", "").split(",")]
+    if len(parts) != 4:
+        raise SystemExit(f"error: --crop wants 'x0,y0,x1,y1', got {s!r}")
+    return tuple(parts)
+
+
 def options_from_args(a: argparse.Namespace) -> Options:
     return Options(
         invert=a.invert,
         threshold=a.threshold,
         canny=a.canny,
         blur=a.blur,
+        adaptive=a.adaptive,
+        adaptive_block=a.adaptive_block,
+        adaptive_c=a.adaptive_c,
+        color=_parse_color(a.color),
+        color_tol=_parse_color_tol(a.color_tol),
+        crop=_parse_crop(a.crop),
         min_area=a.min_area,
         external_only=a.external_only,
         fit=not a.no_fit,
@@ -1146,6 +1464,7 @@ def options_from_args(a: argparse.Namespace) -> Options:
         weld=a.weld,
         centerline=a.centerline,
         fillet=a.fillet,
+        merge=not a.no_merge,
         epsilon=a.epsilon,
         smooth=a.smooth,
         resample=a.resample,

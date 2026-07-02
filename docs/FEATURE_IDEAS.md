@@ -98,6 +98,15 @@ geometry work.
 
 ## Tier 2 — Medium features (the big usability levers)
 
+> **✅ Tier 2 is implemented** (crop box, masking brush + GrabCut "Isolate
+> subject", eyedropper color isolation, adaptive threshold, interactive
+> threshold + live histogram, entity-reduction/merge pass, and the 1-/2-line
+> click-to-scale). The GUI was reorganized around a **canvas tool-mode toolbar**
+> (Pan · Crop · Brush · Pick · Measure · Fit) and a pipeline-ordered sidebar
+> (Source → 1 Prepare → 2 Trace → 3 Scale/Output → Display → Legend). Two extra
+> viewer aids landed alongside: a **background view** toggle (dimmed mask ↔
+> original image) and a **highlight-detected-pixels** overlay. See CLAUDE.md.
+
 ### 7. In-GUI crop / region-of-interest box ★ · Cmplx 3 · QoL 5
 Drag a rectangle on the loaded image to restrict tracing to that region. This is
 *the* answer to "isolate one outline in a busy image" (see WORKFLOW.md §5) without
